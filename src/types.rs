@@ -457,60 +457,19 @@ impl From<String> for CommandId {
 ///
 /// This is the "input" form - what the client provides when appending.
 /// It doesn't have position/revision yet (those are assigned during append).
-///
-/// # Fields
-///
-/// - `event_type`: Optional classification (e.g., "OrderCreated", "UserUpdated")
-/// - `data`: The event payload as bytes (JSON, protobuf, etc.)
-/// - `metadata`: Optional additional context (correlation IDs, user info, etc.)
 #[derive(Debug, Clone)]
 pub struct EventData {
-    /// The type of event, for filtering and routing.
-    ///
-    /// Optional but recommended. Examples:
-    /// - "OrderCreated"
-    /// - "user.updated"
-    /// - "inventory/item-reserved"
-    pub event_type: Option<String>,
-
     /// The event payload.
     ///
     /// SpiteDB is payload-agnostic - it's just bytes. The client chooses
     /// the serialization format (JSON, protobuf, messagepack, etc.).
     pub data: Vec<u8>,
-
-    /// Optional metadata about the event.
-    ///
-    /// Useful for cross-cutting concerns that shouldn't be in the domain event:
-    /// - Correlation ID for distributed tracing
-    /// - User ID who triggered the event
-    /// - Causation ID (which event caused this one)
-    pub metadata: Option<Vec<u8>>,
 }
 
 impl EventData {
-    /// Creates a new event with just data, no type or metadata.
+    /// Creates a new event with the given data.
     pub fn new(data: impl Into<Vec<u8>>) -> Self {
-        Self {
-            event_type: None,
-            data: data.into(),
-            metadata: None,
-        }
-    }
-
-    /// Creates a new event with a type.
-    pub fn with_type(event_type: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
-        Self {
-            event_type: Some(event_type.into()),
-            data: data.into(),
-            metadata: None,
-        }
-    }
-
-    /// Adds metadata to this event (builder pattern).
-    pub fn with_metadata(mut self, metadata: impl Into<Vec<u8>>) -> Self {
-        self.metadata = Some(metadata.into());
-        self
+        Self { data: data.into() }
     }
 }
 
@@ -530,16 +489,11 @@ pub struct Event {
     pub stream_rev: StreamRev,
 
     /// When the event was stored (Unix milliseconds).
+    /// This is the batch creation time.
     pub timestamp_ms: u64,
-
-    /// The event type, if provided.
-    pub event_type: Option<String>,
 
     /// The event payload.
     pub data: Vec<u8>,
-
-    /// The event metadata, if provided.
-    pub metadata: Option<Vec<u8>>,
 }
 
 // =============================================================================
@@ -647,6 +601,63 @@ impl AppendResult {
 }
 
 // =============================================================================
+// Cache Types
+// =============================================================================
+
+/// Maximum number of commands to keep in the LRU cache.
+///
+/// At 100 bytes per entry (command_id + positions + timestamp), 100K entries
+/// uses ~10MB of memory. This covers several hours of high-throughput operation.
+pub const COMMAND_CACHE_MAX_ENTRIES: usize = 100_000;
+
+/// Time-to-live for cached commands in milliseconds (12 hours).
+///
+/// Commands older than this are considered expired and will be evicted.
+/// 12 hours provides generous margin for network partitions and retries.
+pub const COMMAND_CACHE_TTL_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// Cached information about a stream's current state.
+///
+/// Used by the writer and reader to track stream heads in memory,
+/// avoiding database lookups for conflict detection.
+#[derive(Debug, Clone)]
+pub struct StreamHeadEntry {
+    /// The original stream ID string.
+    pub stream_id: StreamId,
+    /// Collision slot (usually 0).
+    pub collision_slot: CollisionSlot,
+    /// Current revision (number of events in stream).
+    pub last_rev: StreamRev,
+    /// Global position of the last event.
+    pub last_pos: GlobalPos,
+}
+
+/// Cached result of a processed command for idempotency.
+///
+/// When a client retries a command (same command_id), we return the cached
+/// result instead of re-processing. This ensures exactly-once semantics.
+#[derive(Debug, Clone)]
+pub struct CommandCacheEntry {
+    /// First global position written by this command.
+    pub first_pos: GlobalPos,
+    /// Last global position written by this command.
+    pub last_pos: GlobalPos,
+    /// First stream revision written.
+    pub first_rev: StreamRev,
+    /// Last stream revision written.
+    pub last_rev: StreamRev,
+    /// When this command was processed (Unix milliseconds).
+    pub created_ms: u64,
+}
+
+impl CommandCacheEntry {
+    /// Converts the cache entry to an AppendResult.
+    pub fn to_append_result(&self) -> AppendResult {
+        AppendResult::new(self.first_pos, self.last_pos, self.first_rev, self.last_rev)
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -718,17 +729,13 @@ mod tests {
     }
 
     #[test]
-    fn test_event_data_builders() {
-        let simple = EventData::new(b"hello".to_vec());
-        assert!(simple.event_type.is_none());
-        assert_eq!(simple.data, b"hello");
+    fn test_event_data_new() {
+        let event = EventData::new(b"hello".to_vec());
+        assert_eq!(event.data, b"hello");
 
-        let typed = EventData::with_type("Greeting", b"hello".to_vec());
-        assert_eq!(typed.event_type, Some("Greeting".to_string()));
-
-        let with_meta = EventData::new(b"hello".to_vec())
-            .with_metadata(b"meta".to_vec());
-        assert_eq!(with_meta.metadata, Some(b"meta".to_vec()));
+        // Also works with Into<Vec<u8>>
+        let event2 = EventData::new(vec![1, 2, 3]);
+        assert_eq!(event2.data, vec![1, 2, 3]);
     }
 
     #[test]

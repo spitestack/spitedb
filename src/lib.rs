@@ -49,10 +49,12 @@
 //! - [`error`]: Custom error types for all failure modes
 //! - [`schema`]: SQLite DDL and database initialization
 //! - [`types`]: Domain types (StreamId, Event, GlobalPos, etc.)
+//! - [`codec`]: Event batch encoding/decoding and checksums
+//! - [`writer`]: Batch writer with group commit and SAVEPOINT isolation
+//! - [`reader`]: Read operations with pooled connections
+//! - [`api`]: Async API (main entry point)
 //!
 //! Future modules (not yet implemented):
-//! - `storage`: Synchronous storage operations
-//! - `writer`: Group commit and batching logic
 //! - `ha`: High availability and epoch fencing
 
 // =============================================================================
@@ -80,21 +82,17 @@ pub mod schema;
 /// and commands. Uses the newtype pattern for type safety.
 pub mod types;
 
-/// Synchronous storage layer.
+/// Event batch encoding and decoding.
 ///
-/// This module provides the core storage operations: appending events,
-/// reading streams, and reading from the global log. It wraps SQLite
-/// and maintains an in-memory cache of stream heads.
-pub mod storage;
+/// This module provides the codec for encoding events into batches and decoding
+/// them back. The batch format is designed for efficient storage and retrieval.
+pub mod codec;
 
-/// Actor-based concurrency layer (synchronous).
+/// Read operations for SpiteDB.
 ///
-/// This module provides thread-safe access to storage via the actor pattern.
-/// The `StorageActor` runs on a dedicated thread and processes requests
-/// via message passing, enforcing the single-writer invariant.
-///
-/// For async usage, see the [`api`] module instead.
-pub mod actor;
+/// This module provides read operations using direct SQL queries. It ensures
+/// readers always see the latest committed data via WAL mode.
+pub mod reader;
 
 /// Async API for SpiteDB.
 ///
@@ -105,17 +103,30 @@ pub mod actor;
 /// The main entry point is [`SpiteDB`](api::SpiteDB).
 pub mod api;
 
+/// Batch writer with group commit.
+///
+/// This module implements high-throughput batched writes using SQLite's
+/// SAVEPOINT mechanism for per-command isolation within a single transaction.
+/// Commands are collected over a configurable time window (default 10ms) and
+/// executed together, amortizing the cost of fsync.
+///
+/// Key features:
+/// - Group commit for throughput (many commands, one fsync)
+/// - SAVEPOINT isolation (conflict in cmd2 doesn't affect cmd1 or cmd3)
+/// - Transaction API for guaranteed same-batch writes across streams
+/// - Staged/committed state separation for memory safety
+pub mod writer;
+
 // =============================================================================
 // Re-exports
 // =============================================================================
 // Rust pattern: Re-export commonly used types at the crate root for convenience.
 // Users can write `use spitedb::Error` instead of `use spitedb::error::Error`.
 
-pub use actor::{ReadPool, StorageActor, StorageHandle, WriteActor};
 pub use api::SpiteDB;
 pub use error::{Error, Result};
 pub use schema::Database;
-pub use storage::Storage;
+pub use writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer};
 
 // Re-export commonly used types from the types module
 pub use types::{

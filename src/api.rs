@@ -74,20 +74,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, available_parallelism, JoinHandle};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{Error, Result};
+use crate::reader::{self, ReadRequest};
 use crate::schema::Database;
-use crate::storage::Storage;
 use crate::types::{AppendCommand, AppendResult, Event, GlobalPos, StreamId, StreamRev};
+use crate::writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer};
 
 // =============================================================================
 // Configuration
 // =============================================================================
-
-/// Size of the write request channel.
-const WRITE_CHANNEL_SIZE: usize = 1024;
 
 /// Size of the read request channel.
 const READ_CHANNEL_SIZE: usize = 4096;
@@ -97,39 +95,6 @@ const MIN_READ_THREADS: usize = 1;
 
 /// Maximum number of reader threads.
 const MAX_READ_THREADS: usize = 16;
-
-// =============================================================================
-// Request Types
-// =============================================================================
-
-/// Internal request type for write operations.
-enum WriteRequest {
-    Append {
-        command: AppendCommand,
-        response: oneshot::Sender<Result<AppendResult>>,
-    },
-    Shutdown,
-}
-
-/// Internal request type for read operations.
-enum ReadRequest {
-    ReadStream {
-        stream_id: StreamId,
-        from_rev: StreamRev,
-        limit: usize,
-        response: oneshot::Sender<Result<Vec<Event>>>,
-    },
-    ReadGlobal {
-        from_pos: GlobalPos,
-        limit: usize,
-        response: oneshot::Sender<Result<Vec<Event>>>,
-    },
-    GetStreamRevision {
-        stream_id: StreamId,
-        response: oneshot::Sender<StreamRev>,
-    },
-    Shutdown,
-}
 
 // =============================================================================
 // SpiteDB - The Main Async Handle
@@ -205,14 +170,11 @@ enum ReadRequest {
 /// ```
 #[derive(Clone)]
 pub struct SpiteDB {
-    /// Channel to send write requests.
-    write_tx: mpsc::Sender<WriteRequest>,
+    /// Batch writer handle for write operations with group commit.
+    writer: BatchWriterHandle,
 
     /// Channel to send read requests.
     read_tx: mpsc::Sender<ReadRequest>,
-
-    /// Handle to the writer thread (for shutdown).
-    writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 
     /// Handles to the reader threads (for shutdown).
     reader_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -255,44 +217,20 @@ impl SpiteDB {
 
     /// Internal implementation that handles both file and in-memory databases.
     async fn open_internal(path: Option<PathBuf>) -> Result<Self> {
-        // Create channels
-        // Note: mpsc::channel creates the async Tokio channel
-        let (write_tx, write_rx) = mpsc::channel(WRITE_CHANNEL_SIZE);
+        // Create read channel
         let (read_tx, read_rx) = mpsc::channel(READ_CHANNEL_SIZE);
 
         // Clone path for reader threads
         let read_path = path.clone();
 
-        // Spawn writer thread
-        // We use std::thread because Storage isn't Send+Sync
-        // The thread owns Storage and communicates via channels
-        let writer_handle = thread::Builder::new()
-            .name("spitedb-async-writer".to_string())
-            .spawn(move || {
-                // Create runtime for receiving from async channel
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to create writer runtime");
+        // Initialize the database and spawn the batch writer
+        let db = match &path {
+            Some(p) => Database::open(p)?,
+            None => Database::open_in_memory()?,
+        };
 
-                rt.block_on(async {
-                    // Initialize storage
-                    let storage = match &path {
-                        Some(p) => {
-                            let db = Database::open(p).expect("failed to open database");
-                            Storage::new(db.into_connection()).expect("failed to create storage")
-                        }
-                        None => {
-                            let db =
-                                Database::open_in_memory().expect("failed to open in-memory db");
-                            Storage::new(db.into_connection()).expect("failed to create storage")
-                        }
-                    };
-
-                    run_writer(storage, write_rx).await;
-                });
-            })
-            .map_err(|e| Error::Schema(format!("failed to spawn writer thread: {}", e)))?;
+        // Spawn batch writer with default config (10ms batch timeout)
+        let writer = spawn_batch_writer(db.into_connection(), WriterConfig::default())?;
 
         // Determine reader thread count based on available CPUs
         // For in-memory databases, we use 1 thread (can't share the connection)
@@ -336,15 +274,15 @@ impl SpiteDB {
                                     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
                                 )
                                 .expect("failed to open read-only connection");
-                                run_reader_direct_pooled(conn, rx).await;
+                                reader::run_reader_pooled(conn, rx).await;
                             }
                             None => {
-                                // In-memory: use Storage (single thread only)
+                                // In-memory: create a separate in-memory DB for reads
+                                // Note: This won't see writes from the writer for in-memory DBs.
+                                // In-memory mode is primarily for testing the writer.
                                 let db =
                                     Database::open_in_memory().expect("failed to open in-memory db");
-                                let storage =
-                                    Storage::new(db.into_connection()).expect("failed to create storage");
-                                run_reader_pooled(storage, rx).await;
+                                reader::run_reader_pooled(db.into_connection(), rx).await;
                             }
                         }
                     });
@@ -355,9 +293,8 @@ impl SpiteDB {
         }
 
         Ok(Self {
-            write_tx,
+            writer,
             read_tx,
-            writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
             reader_handles: Arc::new(Mutex::new(reader_handles)),
             reader_count,
         })
@@ -370,6 +307,11 @@ impl SpiteDB {
 
     /// Appends events to a stream.
     ///
+    /// # Group Commit
+    ///
+    /// Writes are batched with other concurrent writes for efficiency. The batch
+    /// timeout (default 10ms) ensures low latency while maximizing throughput.
+    ///
     /// # Exactly-Once Semantics
     ///
     /// If `command.command_id` was already processed, returns the cached result
@@ -380,19 +322,37 @@ impl SpiteDB {
     /// - `Error::Conflict` if `expected_rev` doesn't match current revision
     /// - `Error::Schema` if the database connection is closed
     pub async fn append(&self, command: AppendCommand) -> Result<AppendResult> {
-        let (response_tx, response_rx) = oneshot::channel();
+        self.writer.append(command).await
+    }
 
-        self.write_tx
-            .send(WriteRequest::Append {
-                command,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Error::Schema("writer thread has shut down".to_string()))?;
-
-        response_rx
-            .await
-            .map_err(|_| Error::Schema("writer dropped response channel".to_string()))?
+    /// Begins a transaction for guaranteed same-batch writes.
+    ///
+    /// # Use Case
+    ///
+    /// When you need multiple append operations to be written atomically in the
+    /// same SQLite transaction. This is useful for:
+    ///
+    /// - Cross-stream operations that must succeed or fail together
+    /// - Ensuring related events have contiguous global positions
+    /// - Reducing latency by bundling multiple writes
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut tx = db.begin_transaction();
+    /// tx.append(AppendCommand::new("cmd-1", "stream-a", StreamRev::NONE, events1));
+    /// tx.append(AppendCommand::new("cmd-2", "stream-b", StreamRev::NONE, events2));
+    /// let results = tx.submit().await?;
+    /// // Both writes are in the same batch - contiguous positions guaranteed
+    /// ```
+    ///
+    /// # Per-Command Isolation
+    ///
+    /// Each command in the transaction runs in its own SAVEPOINT. If one command
+    /// fails (e.g., conflict), others can still succeed. The results vector
+    /// contains a result for each command in submission order.
+    pub fn begin_transaction(&self) -> TransactionBuilder {
+        self.writer.begin_transaction()
     }
 
     /// Reads events from a specific stream.
@@ -479,26 +439,20 @@ impl SpiteDB {
     ///
     /// # Graceful Shutdown
     ///
-    /// 1. Sends shutdown signal to writer and all reader threads
+    /// 1. Sends shutdown signal to all reader threads
     /// 2. Waits for threads to complete (they'll finish current work first)
     /// 3. SQLite connections are closed when Storage is dropped
+    ///
+    /// Note: The batch writer thread will shut down when the last handle is dropped.
     ///
     /// # Important
     ///
     /// After shutdown, all operations will fail. Create a new SpiteDB instance
     /// if you need to reopen the database.
     pub async fn shutdown(self) {
-        // Send shutdown signal to writer
-        let _ = self.write_tx.send(WriteRequest::Shutdown).await;
-
         // Send shutdown signals to all reader threads
         for _ in 0..self.reader_count {
             let _ = self.read_tx.send(ReadRequest::Shutdown).await;
-        }
-
-        // Wait for writer to complete
-        if let Some(handle) = self.writer_handle.lock().await.take() {
-            let _ = handle.join();
         }
 
         // Wait for all reader threads to complete
@@ -506,454 +460,10 @@ impl SpiteDB {
         for handle in handles {
             let _ = handle.join();
         }
+
+        // Batch writer shuts down when the last handle is dropped
+        // (which happens when self is dropped at end of this function)
     }
-}
-
-// =============================================================================
-// Worker Functions
-// =============================================================================
-
-/// The writer loop that processes write requests.
-///
-/// Runs on a dedicated thread, receives requests via async channel,
-/// executes synchronously on Storage.
-async fn run_writer(mut storage: Storage, mut rx: mpsc::Receiver<WriteRequest>) {
-    while let Some(request) = rx.recv().await {
-        match request {
-            WriteRequest::Append { command, response } => {
-                let result = storage.append(command);
-                let _ = response.send(result);
-            }
-            WriteRequest::Shutdown => break,
-        }
-    }
-}
-
-/// The reader loop that processes read requests using Storage (for in-memory DBs).
-/// This version is for single-thread use (takes ownership of receiver).
-#[allow(dead_code)]
-async fn run_reader(storage: Storage, mut rx: mpsc::Receiver<ReadRequest>) {
-    while let Some(request) = rx.recv().await {
-        match request {
-            ReadRequest::ReadStream {
-                stream_id,
-                from_rev,
-                limit,
-                response,
-            } => {
-                let result = storage.read_stream(&stream_id, from_rev, limit);
-                let _ = response.send(result);
-            }
-            ReadRequest::ReadGlobal {
-                from_pos,
-                limit,
-                response,
-            } => {
-                let result = storage.read_global(from_pos, limit);
-                let _ = response.send(result);
-            }
-            ReadRequest::GetStreamRevision {
-                stream_id,
-                response,
-            } => {
-                let result = storage.get_stream_revision(&stream_id);
-                let _ = response.send(result);
-            }
-            ReadRequest::Shutdown => break,
-        }
-    }
-}
-
-/// The reader loop using direct SQL queries (for file-based DBs).
-/// This version is for single-thread use (takes ownership of receiver).
-#[allow(dead_code)]
-async fn run_reader_direct(conn: Connection, mut rx: mpsc::Receiver<ReadRequest>) {
-    while let Some(request) = rx.recv().await {
-        match request {
-            ReadRequest::ReadStream {
-                stream_id,
-                from_rev,
-                limit,
-                response,
-            } => {
-                let result = read_stream_direct(&conn, &stream_id, from_rev, limit);
-                let _ = response.send(result);
-            }
-            ReadRequest::ReadGlobal {
-                from_pos,
-                limit,
-                response,
-            } => {
-                let result = read_global_direct(&conn, from_pos, limit);
-                let _ = response.send(result);
-            }
-            ReadRequest::GetStreamRevision {
-                stream_id,
-                response,
-            } => {
-                let result = get_stream_revision_direct(&conn, &stream_id);
-                let _ = response.send(result);
-            }
-            ReadRequest::Shutdown => break,
-        }
-    }
-}
-
-/// Pooled reader using Storage (for in-memory DBs).
-///
-/// # Load Balancing
-///
-/// Multiple threads share the channel via Arc<Mutex>. Threads compete to
-/// acquire the lock and receive the next request. This provides simple but
-/// effective load balancing - whichever thread is free picks up the next request.
-async fn run_reader_pooled(
-    storage: Storage,
-    rx: Arc<std::sync::Mutex<mpsc::Receiver<ReadRequest>>>,
-) {
-    loop {
-        // Lock the receiver to get the next request
-        // This provides simple load balancing - threads compete for work
-        let request = {
-            let mut guard = rx.lock().expect("receiver mutex poisoned");
-            guard.recv().await
-        };
-
-        match request {
-            Some(ReadRequest::ReadStream {
-                stream_id,
-                from_rev,
-                limit,
-                response,
-            }) => {
-                let result = storage.read_stream(&stream_id, from_rev, limit);
-                let _ = response.send(result);
-            }
-            Some(ReadRequest::ReadGlobal {
-                from_pos,
-                limit,
-                response,
-            }) => {
-                let result = storage.read_global(from_pos, limit);
-                let _ = response.send(result);
-            }
-            Some(ReadRequest::GetStreamRevision {
-                stream_id,
-                response,
-            }) => {
-                let result = storage.get_stream_revision(&stream_id);
-                let _ = response.send(result);
-            }
-            Some(ReadRequest::Shutdown) | None => break,
-        }
-    }
-}
-
-/// Pooled reader using direct SQL queries (for file-based DBs).
-///
-/// # Why Direct Queries?
-///
-/// For file-based databases with separate reader/writer connections, using
-/// Storage would cache stream_heads at startup. Since the reader doesn't
-/// see the writer's in-memory updates, it would have stale data.
-///
-/// By using direct SQL queries, we always read the latest committed data
-/// from the database file (via SQLite's WAL mode).
-///
-/// # Load Balancing
-///
-/// Multiple threads share the channel via Arc<Mutex>. Each thread has its own
-/// read-only SQLite connection, so they can execute queries in parallel.
-async fn run_reader_direct_pooled(
-    conn: Connection,
-    rx: Arc<std::sync::Mutex<mpsc::Receiver<ReadRequest>>>,
-) {
-    loop {
-        // Lock the receiver to get the next request
-        let request = {
-            let mut guard = rx.lock().expect("receiver mutex poisoned");
-            guard.recv().await
-        };
-
-        match request {
-            Some(ReadRequest::ReadStream {
-                stream_id,
-                from_rev,
-                limit,
-                response,
-            }) => {
-                let result = read_stream_direct(&conn, &stream_id, from_rev, limit);
-                let _ = response.send(result);
-            }
-            Some(ReadRequest::ReadGlobal {
-                from_pos,
-                limit,
-                response,
-            }) => {
-                let result = read_global_direct(&conn, from_pos, limit);
-                let _ = response.send(result);
-            }
-            Some(ReadRequest::GetStreamRevision {
-                stream_id,
-                response,
-            }) => {
-                let result = get_stream_revision_direct(&conn, &stream_id);
-                let _ = response.send(result);
-            }
-            Some(ReadRequest::Shutdown) | None => break,
-        }
-    }
-}
-
-// =============================================================================
-// Direct Read Functions (for read-only connections)
-// =============================================================================
-
-/// Reads events from a stream using direct SQL queries.
-fn read_stream_direct(
-    conn: &Connection,
-    stream_id: &StreamId,
-    from_rev: StreamRev,
-    limit: usize,
-) -> Result<Vec<Event>> {
-    let stream_hash = stream_id.hash();
-
-    // Get collision slot from stream_heads
-    let collision_slot: i64 = conn
-        .query_row(
-            "SELECT collision_slot FROM stream_heads WHERE stream_id = ?",
-            [stream_id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    let mut stmt = conn.prepare(
-        "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev, b.data
-         FROM event_index e
-         JOIN batches b ON e.batch_id = b.batch_id
-         WHERE e.stream_hash = ? AND e.collision_slot = ? AND e.stream_rev >= ?
-         ORDER BY e.stream_rev
-         LIMIT ?",
-    )?;
-
-    let events = stmt.query_map(
-        params![
-            stream_hash.as_raw(),
-            collision_slot,
-            from_rev.as_raw() as i64,
-            limit as i64,
-        ],
-        |row| {
-            let global_pos: i64 = row.get(0)?;
-            let byte_offset: i64 = row.get(1)?;
-            let byte_len: i64 = row.get(2)?;
-            let stream_rev: i64 = row.get(3)?;
-            let batch_data: Vec<u8> = row.get(4)?;
-
-            Ok((global_pos, byte_offset, byte_len, stream_rev, batch_data))
-        },
-    )?;
-
-    let mut result = Vec::new();
-    for event_data in events {
-        let (global_pos, byte_offset, byte_len, stream_rev, batch_data) = event_data?;
-
-        let event = decode_event(
-            &batch_data,
-            byte_offset as usize,
-            byte_len as usize,
-            GlobalPos::from_raw_unchecked(global_pos as u64),
-            stream_id.clone(),
-            StreamRev::from_raw(stream_rev as u64),
-        )?;
-
-        result.push(event);
-    }
-
-    Ok(result)
-}
-
-/// Reads events from the global log using direct SQL queries.
-fn read_global_direct(conn: &Connection, from_pos: GlobalPos, limit: usize) -> Result<Vec<Event>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_hash, e.collision_slot, e.stream_rev, b.data
-         FROM event_index e
-         JOIN batches b ON e.batch_id = b.batch_id
-         WHERE e.global_pos >= ?
-         ORDER BY e.global_pos
-         LIMIT ?",
-    )?;
-
-    let events = stmt.query_map(params![from_pos.as_raw() as i64, limit as i64], |row| {
-        let global_pos: i64 = row.get(0)?;
-        let byte_offset: i64 = row.get(1)?;
-        let byte_len: i64 = row.get(2)?;
-        let _stream_hash: i64 = row.get(3)?;
-        let _collision_slot: i64 = row.get(4)?;
-        let stream_rev: i64 = row.get(5)?;
-        let batch_data: Vec<u8> = row.get(6)?;
-
-        Ok((global_pos, byte_offset, byte_len, stream_rev, batch_data))
-    })?;
-
-    let mut result = Vec::new();
-    for event_data in events {
-        let (global_pos, byte_offset, byte_len, stream_rev, batch_data) = event_data?;
-
-        let event = decode_event_with_stream_id(
-            &batch_data,
-            byte_offset as usize,
-            byte_len as usize,
-            GlobalPos::from_raw_unchecked(global_pos as u64),
-            StreamRev::from_raw(stream_rev as u64),
-        )?;
-
-        result.push(event);
-    }
-
-    Ok(result)
-}
-
-/// Gets stream revision using direct SQL queries.
-fn get_stream_revision_direct(conn: &Connection, stream_id: &StreamId) -> StreamRev {
-    conn.query_row(
-        "SELECT last_rev FROM stream_heads WHERE stream_id = ?",
-        [stream_id.as_str()],
-        |row| {
-            let rev: i64 = row.get(0)?;
-            Ok(StreamRev::from_raw(rev as u64))
-        },
-    )
-    .unwrap_or(StreamRev::NONE)
-}
-
-// =============================================================================
-// Event Decoding
-// =============================================================================
-
-/// Decodes an event from batch data when stream_id is known.
-fn decode_event(
-    batch_data: &[u8],
-    offset: usize,
-    len: usize,
-    global_pos: GlobalPos,
-    stream_id: StreamId,
-    stream_rev: StreamRev,
-) -> Result<Event> {
-    let event_data = &batch_data[offset..offset + len];
-    let mut cursor = 0;
-
-    // Skip stream_id (already provided)
-    let stream_id_len = read_u32(event_data, &mut cursor) as usize;
-    cursor += stream_id_len;
-
-    // Event type
-    let event_type_len = read_u32(event_data, &mut cursor) as usize;
-    let event_type = if event_type_len > 0 {
-        let s = std::str::from_utf8(&event_data[cursor..cursor + event_type_len])
-            .map_err(|e| Error::Schema(format!("invalid event_type UTF-8: {}", e)))?;
-        cursor += event_type_len;
-        Some(s.to_string())
-    } else {
-        None
-    };
-
-    // Timestamp
-    let timestamp_ms = read_u64(event_data, &mut cursor);
-
-    // Metadata
-    let metadata_len = read_u32(event_data, &mut cursor) as usize;
-    let metadata = if metadata_len > 0 {
-        let m = event_data[cursor..cursor + metadata_len].to_vec();
-        cursor += metadata_len;
-        Some(m)
-    } else {
-        None
-    };
-
-    // Data
-    let data_len = read_u32(event_data, &mut cursor) as usize;
-    let data = event_data[cursor..cursor + data_len].to_vec();
-
-    Ok(Event {
-        global_pos,
-        stream_id,
-        stream_rev,
-        timestamp_ms,
-        event_type,
-        data,
-        metadata,
-    })
-}
-
-/// Decodes an event from batch data, extracting stream_id from the data.
-fn decode_event_with_stream_id(
-    batch_data: &[u8],
-    offset: usize,
-    len: usize,
-    global_pos: GlobalPos,
-    stream_rev: StreamRev,
-) -> Result<Event> {
-    let event_data = &batch_data[offset..offset + len];
-    let mut cursor = 0;
-
-    // Stream ID
-    let stream_id_len = read_u32(event_data, &mut cursor) as usize;
-    let stream_id_str = std::str::from_utf8(&event_data[cursor..cursor + stream_id_len])
-        .map_err(|e| Error::Schema(format!("invalid stream_id UTF-8: {}", e)))?;
-    cursor += stream_id_len;
-    let stream_id = StreamId::new(stream_id_str);
-
-    // Event type
-    let event_type_len = read_u32(event_data, &mut cursor) as usize;
-    let event_type = if event_type_len > 0 {
-        let s = std::str::from_utf8(&event_data[cursor..cursor + event_type_len])
-            .map_err(|e| Error::Schema(format!("invalid event_type UTF-8: {}", e)))?;
-        cursor += event_type_len;
-        Some(s.to_string())
-    } else {
-        None
-    };
-
-    // Timestamp
-    let timestamp_ms = read_u64(event_data, &mut cursor);
-
-    // Metadata
-    let metadata_len = read_u32(event_data, &mut cursor) as usize;
-    let metadata = if metadata_len > 0 {
-        let m = event_data[cursor..cursor + metadata_len].to_vec();
-        cursor += metadata_len;
-        Some(m)
-    } else {
-        None
-    };
-
-    // Data
-    let data_len = read_u32(event_data, &mut cursor) as usize;
-    let data = event_data[cursor..cursor + data_len].to_vec();
-
-    Ok(Event {
-        global_pos,
-        stream_id,
-        stream_rev,
-        timestamp_ms,
-        event_type,
-        data,
-        metadata,
-    })
-}
-
-/// Reads a u32 from bytes in little-endian format.
-fn read_u32(data: &[u8], cursor: &mut usize) -> u32 {
-    let bytes: [u8; 4] = data[*cursor..*cursor + 4].try_into().unwrap();
-    *cursor += 4;
-    u32::from_le_bytes(bytes)
-}
-
-/// Reads a u64 from bytes in little-endian format.
-fn read_u64(data: &[u8], cursor: &mut usize) -> u64 {
-    let bytes: [u8; 8] = data[*cursor..*cursor + 8].try_into().unwrap();
-    *cursor += 8;
-    u64::from_le_bytes(bytes)
 }
 
 // =============================================================================
