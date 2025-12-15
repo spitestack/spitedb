@@ -2,3 +2,5 @@ target
 
 CLAUDE.md
 plan.md
+*.node
+node_modules
