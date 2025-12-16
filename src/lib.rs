@@ -146,7 +146,7 @@ pub use writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batc
 // Re-export commonly used types from the types module
 pub use types::{
     AppendCommand, AppendResult, CollisionSlot, CommandId, Event, EventData, GlobalPos,
-    StreamHash, StreamId, StreamRev,
+    StreamHash, StreamId, StreamRev, Tenant, TenantHash,
 };
 
 // Re-export subscription types

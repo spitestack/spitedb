@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS batches (
 ///
 /// # Design Philosophy: Minimal Index
 ///
-/// This table is intentionally slim - only 7 integer columns.
+/// This table is intentionally slim - only 8 integer columns.
 /// All other metadata (stream_id, event_type, ts_ms) lives in the batch blob.
 /// This keeps the B-tree small and fast.
 ///
@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS batches (
 /// - `byte_offset`: Offset within the batch's data blob (where event starts)
 /// - `byte_len`: Length of this event's data within the blob
 /// - `stream_hash`: XXH3-64 hash of stream_id for fast lookups
+/// - `tenant_hash`: XXH3-64 hash of tenant for multi-tenant filtering
 /// - `collision_slot`: Disambiguator for hash collisions (usually 0)
 /// - `stream_rev`: Revision within the stream (1, 2, 3, ...)
 ///
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS event_index (
     byte_offset    INTEGER NOT NULL,
     byte_len       INTEGER NOT NULL,
     stream_hash    INTEGER NOT NULL,
+    tenant_hash    INTEGER NOT NULL,
     collision_slot INTEGER NOT NULL DEFAULT 0,
     stream_rev     INTEGER NOT NULL
 )
@@ -186,6 +188,7 @@ ON event_index(stream_hash, collision_slot, stream_rev)
 ///
 /// - `stream_id`: Original stream ID string (primary key for uniqueness)
 /// - `stream_hash`: XXH3-64 hash of stream_id (for fast indexed lookups)
+/// - `tenant_hash`: XXH3-64 hash of tenant for multi-tenant filtering
 /// - `collision_slot`: Disambiguator for hash collisions (0 for first stream, 1+ for collisions)
 /// - `last_rev`: Most recent stream_rev for this stream
 /// - `last_pos`: global_pos of the most recent event
@@ -222,6 +225,7 @@ const CREATE_STREAM_HEADS: &str = r#"
 CREATE TABLE IF NOT EXISTS stream_heads (
     stream_id      TEXT PRIMARY KEY,
     stream_hash    INTEGER NOT NULL,
+    tenant_hash    INTEGER NOT NULL,
     collision_slot INTEGER NOT NULL DEFAULT 0,
     last_rev       INTEGER NOT NULL,
     last_pos       INTEGER NOT NULL
@@ -237,6 +241,16 @@ CREATE TABLE IF NOT EXISTS stream_heads (
 const CREATE_STREAM_HEADS_HASH_INDEX: &str = r#"
 CREATE INDEX IF NOT EXISTS stream_heads_hash
 ON stream_heads(stream_hash)
+"#;
+
+/// Index for efficient tenant_hash lookups.
+///
+/// Supports multi-tenant queries:
+/// - Find all streams for a given tenant
+/// - Count streams per tenant
+const CREATE_STREAM_HEADS_TENANT_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS stream_heads_tenant
+ON stream_heads(tenant_hash)
 "#;
 
 /// The `commands` table tracks processed commands for idempotency.
@@ -315,6 +329,69 @@ CREATE TABLE IF NOT EXISTS tombstones (
 const CREATE_TOMBSTONES_INDEX: &str = r#"
 CREATE INDEX IF NOT EXISTS tombstones_stream
 ON tombstones(stream_hash, from_rev, to_rev)
+"#;
+
+// =============================================================================
+// Tenant Projection Tables (Eventually Consistent)
+// =============================================================================
+
+/// The `tenant_event_index` table provides fast tenant-filtered event lookups.
+///
+/// # Purpose
+///
+/// This is an eventually consistent projection built from event_index by a
+/// background worker. It allows efficient queries like:
+/// - "Give me all events for tenant X starting from position Y"
+///
+/// # Why a Separate Table?
+///
+/// We keep writes fast by not updating this table synchronously. A background
+/// worker polls event_index and populates this table asynchronously.
+///
+/// # Columns
+///
+/// - `tenant_hash`: Hash of tenant identifier (part of composite PK)
+/// - `global_pos`: Global position from event_index (part of composite PK)
+/// - `stream_hash`: Hash of stream_id for fast stream lookups
+/// - `collision_slot`: Disambiguator for hash collisions
+/// - `stream_rev`: Revision within the stream
+const CREATE_TENANT_EVENT_INDEX: &str = r#"
+CREATE TABLE IF NOT EXISTS tenant_event_index (
+    tenant_hash    INTEGER NOT NULL,
+    global_pos     INTEGER NOT NULL,
+    stream_hash    INTEGER NOT NULL,
+    collision_slot INTEGER NOT NULL DEFAULT 0,
+    stream_rev     INTEGER NOT NULL,
+    PRIMARY KEY (tenant_hash, global_pos)
+)
+"#;
+
+/// Index for efficient tenant + stream lookups.
+///
+/// Supports queries like: "All events for tenant X, stream Y"
+const CREATE_TENANT_EVENT_STREAM_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS tenant_event_tenant_stream
+ON tenant_event_index(tenant_hash, stream_hash, collision_slot, stream_rev)
+"#;
+
+/// The `tenant_projection_checkpoint` table tracks projection progress.
+///
+/// # Purpose
+///
+/// The background worker needs to know where it left off so it can resume
+/// after restarts without reprocessing all events.
+///
+/// # Columns
+///
+/// - `projection_name`: Identifier for the projection (e.g., "tenant_events")
+/// - `last_global_pos`: Last global_pos successfully processed
+/// - `last_processed_ms`: Timestamp of last processing (for monitoring)
+const CREATE_TENANT_PROJECTION_CHECKPOINT: &str = r#"
+CREATE TABLE IF NOT EXISTS tenant_projection_checkpoint (
+    projection_name   TEXT PRIMARY KEY,
+    last_global_pos   INTEGER NOT NULL,
+    last_processed_ms INTEGER NOT NULL
+)
 "#;
 
 /// Metadata table for schema versioning.
@@ -479,7 +556,12 @@ impl Database {
         self.conn.execute_batch(CREATE_EVENT_STREAM_INDEX)?;
         self.conn.execute_batch(CREATE_STREAM_HEADS)?;
         self.conn.execute_batch(CREATE_STREAM_HEADS_HASH_INDEX)?;
+        self.conn.execute_batch(CREATE_STREAM_HEADS_TENANT_INDEX)?;
         self.conn.execute_batch(CREATE_COMMANDS)?;
+        // Tenant projection tables
+        self.conn.execute_batch(CREATE_TENANT_EVENT_INDEX)?;
+        self.conn.execute_batch(CREATE_TENANT_EVENT_STREAM_INDEX)?;
+        self.conn.execute_batch(CREATE_TENANT_PROJECTION_CHECKPOINT)?;
         self.conn.execute_batch(CREATE_TOMBSTONES)?;
         self.conn.execute_batch(CREATE_TOMBSTONES_INDEX)?;
 
@@ -605,8 +687,9 @@ mod tests {
             )
             .expect("should query tables");
 
-        // We expect 6 tables: metadata, batches, event_index, stream_heads, commands, tombstones
-        assert_eq!(count, 6, "expected 6 tables");
+        // We expect 8 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
+        // tenant_event_index, tenant_projection_checkpoint
+        assert_eq!(count, 8, "expected 8 tables");
     }
 
     /// Verify that indexes are created.
@@ -680,7 +763,9 @@ mod tests {
                 )
                 .expect("should query");
 
-            assert_eq!(count, 6);
+            // We expect 8 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
+            // tenant_event_index, tenant_projection_checkpoint
+            assert_eq!(count, 8);
         }
     }
 }

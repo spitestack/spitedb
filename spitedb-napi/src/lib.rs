@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use spitedb::{
     AppendCommand, AppendResult, CommandId, Event, EventData, GlobalPos, SpiteDB, StreamId,
-    StreamRev,
+    StreamRev, Tenant,
 };
 
 mod projection;
@@ -63,6 +63,7 @@ impl SpiteDBNapi {
     /// @param commandId - Unique command ID for idempotency
     /// @param expectedRev - Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision
     /// @param events - Array of event data buffers
+    /// @param tenant - Optional tenant ID (defaults to "default" for single-tenant apps)
     #[napi]
     pub async fn append(
         &self,
@@ -70,6 +71,7 @@ impl SpiteDBNapi {
         command_id: String,
         expected_rev: i64,
         events: Vec<Buffer>,
+        tenant: Option<String>,
     ) -> Result<AppendResultNapi> {
         // Convert expected_rev:
         // -1 = any revision is ok
@@ -89,9 +91,13 @@ impl SpiteDBNapi {
             .map(|buf| EventData::new(buf.to_vec()))
             .collect();
 
-        let command = AppendCommand::new(
+        // Use provided tenant or default to "default"
+        let tenant_obj = tenant.map(Tenant::new).unwrap_or_else(Tenant::default_tenant);
+
+        let command = AppendCommand::new_with_tenant(
             CommandId::new(command_id),
             StreamId::new(stream_id),
+            tenant_obj,
             expected,
             event_data,
         );

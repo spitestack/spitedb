@@ -87,7 +87,7 @@ use crate::error::{Error, Result};
 use crate::subscription::{BroadcastEvent, SubscriptionManager, DEFAULT_BROADCAST_CAPACITY};
 use crate::types::{
     AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId, GlobalPos,
-    StreamHash, StreamHeadEntry, StreamId, StreamRev, COMMAND_CACHE_MAX_ENTRIES,
+    StreamHash, StreamHeadEntry, StreamId, StreamRev, TenantHash, COMMAND_CACHE_MAX_ENTRIES,
     COMMAND_CACHE_TTL_MS,
 };
 
@@ -345,19 +345,21 @@ impl BatchWriter {
     /// Loads stream heads from database.
     fn load_stream_heads(&mut self) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT stream_id, stream_hash, collision_slot, last_rev, last_pos
+            "SELECT stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos
              FROM stream_heads",
         )?;
 
         let entries = stmt.query_map([], |row| {
             let stream_id: String = row.get(0)?;
             let _stream_hash: i64 = row.get(1)?;
-            let collision_slot: i64 = row.get(2)?;
-            let last_rev: i64 = row.get(3)?;
-            let last_pos: i64 = row.get(4)?;
+            let tenant_hash: i64 = row.get(2)?;
+            let collision_slot: i64 = row.get(3)?;
+            let last_rev: i64 = row.get(4)?;
+            let last_pos: i64 = row.get(5)?;
 
             Ok(StreamHeadEntry {
                 stream_id: StreamId::new(stream_id),
+                tenant_hash: TenantHash::from_raw(tenant_hash),
                 collision_slot: CollisionSlot::from_raw(collision_slot as u16),
                 last_rev: StreamRev::from_raw(last_rev as u64),
                 last_pos: GlobalPos::from_raw_unchecked(last_pos as u64),
@@ -691,6 +693,7 @@ impl BatchWriter {
     fn execute_command_inner(&mut self, cmd: &AppendCommand) -> Result<AppendResult> {
         let collision_slot = self.get_or_assign_collision_slot(&cmd.stream_id);
         let stream_hash = cmd.stream_id.hash();
+        let tenant_hash = cmd.tenant.hash();
 
         // Calculate positions using staged state
         let first_pos = self.staged.next_pos;
@@ -729,14 +732,15 @@ impl BatchWriter {
         let mut pos = first_pos;
         for (i, (offset, len)) in event_offsets.iter().enumerate() {
             self.conn.execute(
-                "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, collision_slot, stream_rev)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, tenant_hash, collision_slot, stream_rev)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     pos.as_raw() as i64,
                     batch_id,
                     *offset as i64,
                     *len as i64,
                     stream_hash.as_raw(),
+                    tenant_hash.as_raw(),
                     collision_slot.as_raw() as i64,
                     rev.as_raw() as i64,
                 ],
@@ -746,6 +750,7 @@ impl BatchWriter {
             self.staged.events_to_broadcast.push(BroadcastEvent::new(
                 pos,
                 cmd.stream_id.clone(),
+                tenant_hash,
                 rev,
                 now_ms,
                 cmd.events[i].data.clone(),
@@ -757,14 +762,15 @@ impl BatchWriter {
 
         // Upsert stream head
         self.conn.execute(
-            "INSERT INTO stream_heads (stream_id, stream_hash, collision_slot, last_rev, last_pos)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO stream_heads (stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(stream_id) DO UPDATE SET
                  last_rev = excluded.last_rev,
                  last_pos = excluded.last_pos",
             params![
                 cmd.stream_id.as_str(),
                 stream_hash.as_raw(),
+                tenant_hash.as_raw(),
                 collision_slot.as_raw() as i64,
                 last_rev.as_raw() as i64,
                 last_pos.as_raw() as i64,
@@ -790,6 +796,7 @@ impl BatchWriter {
             (stream_hash, collision_slot),
             StreamHeadEntry {
                 stream_id: cmd.stream_id.clone(),
+                tenant_hash,
                 collision_slot,
                 last_rev,
                 last_pos,

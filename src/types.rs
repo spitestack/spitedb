@@ -161,6 +161,124 @@ impl From<String> for StreamId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamHash(i64);
 
+// =============================================================================
+// Tenant Identification (Multi-Tenancy)
+// =============================================================================
+
+/// A tenant identifier for multi-tenant isolation.
+///
+/// # What is a Tenant?
+///
+/// In multi-tenant systems, a tenant represents an isolated customer or organization.
+/// Each stream belongs to exactly one tenant. Example tenant IDs:
+/// - `"acme-corp"` - all streams for Acme Corporation
+/// - `"tenant-123"` - all streams for tenant 123
+/// - `"default"` - the default tenant for single-tenant applications
+///
+/// # Storage
+///
+/// Like [`StreamId`], tenants are hashed to i64 for efficient storage and comparison.
+/// The original tenant string is not stored - clients must track their own mapping
+/// if needed.
+///
+/// # Default Tenant
+///
+/// Single-tenant applications can omit the tenant parameter, which defaults to
+/// "default". This ensures backward compatibility while enabling multi-tenancy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Tenant(String);
+
+impl Tenant {
+    /// The default tenant string for single-tenant applications.
+    pub const DEFAULT_STR: &'static str = "default";
+
+    /// Creates a new tenant from a string.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Creates the default tenant for single-tenant applications.
+    pub fn default_tenant() -> Self {
+        Self(Self::DEFAULT_STR.to_string())
+    }
+
+    /// Returns the string representation of this tenant.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Computes the hash of this tenant for database storage.
+    ///
+    /// Uses the same XXH3-64 algorithm as [`StreamId::hash`] for consistency.
+    pub fn hash(&self) -> TenantHash {
+        TenantHash(xxhash_rust::xxh3::xxh3_64(self.0.as_bytes()) as i64)
+    }
+}
+
+impl fmt::Display for Tenant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&str> for Tenant {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for Tenant {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl Default for Tenant {
+    fn default() -> Self {
+        Self::default_tenant()
+    }
+}
+
+/// A hash of a [`Tenant`] for efficient database storage.
+///
+/// # Why Hash Tenants?
+///
+/// Same rationale as [`StreamHash`]:
+/// - Fixed 8 bytes regardless of tenant string length
+/// - Fast integer comparisons in queries
+/// - Consistent with stream_hash pattern
+///
+/// # Collision Handling
+///
+/// Unlike streams (which can number in millions), tenants are typically
+/// few (dozens to thousands). With 64-bit hashes, collisions are negligible
+/// and we don't implement collision slots for tenants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TenantHash(i64);
+
+impl TenantHash {
+    /// Returns the hash of the default tenant.
+    pub fn default_hash() -> Self {
+        Tenant::default_tenant().hash()
+    }
+
+    /// Creates a TenantHash from a raw integer value.
+    pub fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw integer value for database storage.
+    pub fn as_raw(&self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for TenantHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
 /// A slot for disambiguating hash collisions.
 ///
 /// # Purpose
@@ -509,6 +627,11 @@ pub struct Event {
 /// - If it doesn't match, append fails with a conflict error
 ///
 /// This prevents lost updates when multiple clients append to the same stream.
+///
+/// # Multi-Tenancy
+///
+/// The `tenant` field specifies which tenant this stream belongs to. If not
+/// specified, it defaults to the "default" tenant for backward compatibility.
 #[derive(Debug, Clone)]
 pub struct AppendCommand {
     /// Unique identifier for idempotency.
@@ -518,6 +641,11 @@ pub struct AppendCommand {
 
     /// The stream to append to.
     pub stream_id: StreamId,
+
+    /// The tenant this stream belongs to.
+    ///
+    /// Defaults to "default" for single-tenant applications.
+    pub tenant: Tenant,
 
     /// Expected current revision of the stream.
     ///
@@ -532,7 +660,7 @@ pub struct AppendCommand {
 }
 
 impl AppendCommand {
-    /// Creates a new append command.
+    /// Creates a new append command with the default tenant.
     ///
     /// # Arguments
     ///
@@ -550,10 +678,34 @@ impl AppendCommand {
         expected_rev: StreamRev,
         events: Vec<EventData>,
     ) -> Self {
+        Self::new_with_tenant(command_id, stream_id, Tenant::default_tenant(), expected_rev, events)
+    }
+
+    /// Creates a new append command with a specific tenant.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Unique ID for idempotency
+    /// * `stream_id` - Target stream
+    /// * `tenant` - The tenant this stream belongs to
+    /// * `expected_rev` - Expected current revision (for optimistic concurrency)
+    /// * `events` - Events to append (must be non-empty)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `events` is empty.
+    pub fn new_with_tenant(
+        command_id: impl Into<CommandId>,
+        stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
+        expected_rev: StreamRev,
+        events: Vec<EventData>,
+    ) -> Self {
         assert!(!events.is_empty(), "AppendCommand must have at least one event");
         Self {
             command_id: command_id.into(),
             stream_id: stream_id.into(),
+            tenant: tenant.into(),
             expected_rev,
             events,
         }
@@ -624,6 +776,8 @@ pub const COMMAND_CACHE_TTL_MS: u64 = 12 * 60 * 60 * 1000;
 pub struct StreamHeadEntry {
     /// The original stream ID string.
     pub stream_id: StreamId,
+    /// The tenant this stream belongs to (hashed).
+    pub tenant_hash: TenantHash,
     /// Collision slot (usually 0).
     pub collision_slot: CollisionSlot,
     /// Current revision (number of events in stream).

@@ -56,7 +56,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
-use crate::types::{Event, GlobalPos, StreamId, StreamRev};
+use crate::types::{Event, GlobalPos, StreamId, StreamRev, TenantHash};
 
 // =============================================================================
 // Configuration
@@ -90,6 +90,9 @@ pub struct BroadcastEvent {
     /// Stream this event belongs to.
     pub stream_id: StreamId,
 
+    /// Tenant this stream belongs to (hashed).
+    pub tenant_hash: TenantHash,
+
     /// Revision within the stream.
     pub stream_rev: StreamRev,
 
@@ -105,6 +108,7 @@ impl BroadcastEvent {
     pub fn new(
         global_pos: GlobalPos,
         stream_id: StreamId,
+        tenant_hash: TenantHash,
         stream_rev: StreamRev,
         timestamp_ms: u64,
         data: Vec<u8>,
@@ -112,6 +116,7 @@ impl BroadcastEvent {
         Self {
             global_pos,
             stream_id,
+            tenant_hash,
             stream_rev,
             timestamp_ms,
             data: std::sync::Arc::new(data),
@@ -135,6 +140,7 @@ impl From<Event> for BroadcastEvent {
         Self::new(
             event.global_pos,
             event.stream_id,
+            TenantHash::default_hash(),
             event.stream_rev,
             event.timestamp_ms,
             event.data,
@@ -996,6 +1002,7 @@ mod tests {
             BroadcastEvent::new(
                 GlobalPos::from_raw(1),
                 StreamId::new("stream-1"),
+                TenantHash::default_hash(),
                 StreamRev::from_raw(1),
                 12345,
                 b"event1".to_vec(),
@@ -1003,6 +1010,7 @@ mod tests {
             BroadcastEvent::new(
                 GlobalPos::from_raw(2),
                 StreamId::new("stream-1"),
+                TenantHash::default_hash(),
                 StreamRev::from_raw(2),
                 12346,
                 b"event2".to_vec(),
@@ -1043,6 +1051,7 @@ mod tests {
         let _ = tx.send(BroadcastEvent::new(
             GlobalPos::from_raw(1),
             StreamId::new("test"),
+            TenantHash::default_hash(),
             StreamRev::from_raw(1),
             12345,
             b"hello".to_vec(),
@@ -1065,6 +1074,7 @@ mod tests {
         let _ = tx.send(BroadcastEvent::new(
             GlobalPos::from_raw(1),
             StreamId::new("unwanted"),
+            TenantHash::default_hash(),
             StreamRev::from_raw(1),
             12345,
             b"skip".to_vec(),
@@ -1073,6 +1083,7 @@ mod tests {
         let _ = tx.send(BroadcastEvent::new(
             GlobalPos::from_raw(2),
             StreamId::new("wanted"),
+            TenantHash::default_hash(),
             StreamRev::from_raw(1),
             12346,
             b"keep".to_vec(),
@@ -1096,6 +1107,7 @@ mod tests {
             let _ = tx.send(BroadcastEvent::new(
                 GlobalPos::from_raw(i),
                 StreamId::new("test"),
+                TenantHash::default_hash(),
                 StreamRev::from_raw(i),
                 12345,
                 format!("event{}", i).into_bytes(),

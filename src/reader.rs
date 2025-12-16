@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::codec::decode_event_data;
 use crate::error::Result;
-use crate::types::{Event, GlobalPos, StreamId, StreamRev};
+use crate::types::{Event, GlobalPos, StreamId, StreamRev, TenantHash};
 
 // =============================================================================
 // Request Types
@@ -58,6 +58,13 @@ pub enum ReadRequest {
     },
     /// Read events from the global log.
     ReadGlobal {
+        from_pos: GlobalPos,
+        limit: usize,
+        response: oneshot::Sender<Result<Vec<Event>>>,
+    },
+    /// Read events for a specific tenant from the global log.
+    ReadTenantEvents {
+        tenant_hash: TenantHash,
         from_pos: GlobalPos,
         limit: usize,
         response: oneshot::Sender<Result<Vec<Event>>>,
@@ -204,6 +211,74 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize) -> Resu
     Ok(result)
 }
 
+/// Reads events for a specific tenant from the event_index.
+///
+/// # Arguments
+///
+/// * `conn` - Read-only SQLite connection
+/// * `tenant_hash` - Hash of the tenant to filter by
+/// * `from_pos` - Starting global position (inclusive)
+/// * `limit` - Maximum number of events to return
+///
+/// # Returns
+///
+/// Events in global position order, filtered by tenant.
+///
+/// # Note
+///
+/// This reads directly from event_index (not the projection table), which
+/// may be slower for large datasets. For production use with many events,
+/// consider using the tenant_event_index projection table instead.
+pub fn read_tenant_events(
+    conn: &Connection,
+    tenant_hash: TenantHash,
+    from_pos: GlobalPos,
+    limit: usize,
+) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev,
+                b.created_ms, b.data, s.stream_id
+         FROM event_index e
+         JOIN batches b ON e.batch_id = b.batch_id
+         JOIN stream_heads s ON e.stream_hash = s.stream_hash AND e.collision_slot = s.collision_slot
+         WHERE e.tenant_hash = ? AND e.global_pos >= ?
+         ORDER BY e.global_pos
+         LIMIT ?",
+    )?;
+
+    let events = stmt.query_map(
+        params![tenant_hash.as_raw(), from_pos.as_raw() as i64, limit as i64],
+        |row| {
+            let global_pos: i64 = row.get(0)?;
+            let byte_offset: i64 = row.get(1)?;
+            let byte_len: i64 = row.get(2)?;
+            let stream_rev: i64 = row.get(3)?;
+            let timestamp_ms: i64 = row.get(4)?;
+            let batch_data: Vec<u8> = row.get(5)?;
+            let stream_id: String = row.get(6)?;
+
+            Ok((global_pos, byte_offset, byte_len, stream_rev, timestamp_ms, batch_data, stream_id))
+        },
+    )?;
+
+    let mut result = Vec::new();
+    for event_data in events {
+        let (global_pos, byte_offset, byte_len, stream_rev, timestamp_ms, batch_data, stream_id) = event_data?;
+
+        let data = decode_event_data(&batch_data, byte_offset as usize, byte_len as usize);
+
+        result.push(Event {
+            global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
+            stream_id: StreamId::new(stream_id),
+            stream_rev: StreamRev::from_raw(stream_rev as u64),
+            timestamp_ms: timestamp_ms as u64,
+            data,
+        });
+    }
+
+    Ok(result)
+}
+
 /// Gets stream revision using direct SQL queries.
 ///
 /// # Returns
@@ -265,6 +340,15 @@ pub async fn run_reader_pooled(
                 let result = read_global(&conn, from_pos, limit);
                 let _ = response.send(result);
             }
+            Some(ReadRequest::ReadTenantEvents {
+                tenant_hash,
+                from_pos,
+                limit,
+                response,
+            }) => {
+                let result = read_tenant_events(&conn, tenant_hash, from_pos, limit);
+                let _ = response.send(result);
+            }
             Some(ReadRequest::GetStreamRevision {
                 stream_id,
                 response,
@@ -319,14 +403,15 @@ mod tests {
             let batch_id = conn.last_insert_rowid();
 
             conn.execute(
-                "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, collision_slot, stream_rev)
-                 VALUES (?, ?, ?, ?, ?, 0, ?)",
+                "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, tenant_hash, collision_slot, stream_rev)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
                 params![
                     global_pos as i64,
                     batch_id,
                     offsets[0].0 as i64,
                     offsets[0].1 as i64,
                     stream_hash.as_raw(),
+                    crate::types::TenantHash::default_hash().as_raw(),
                     stream_rev as i64,
                 ],
             )
@@ -335,9 +420,9 @@ mod tests {
 
         let last_pos = start_pos + count - 1;
         conn.execute(
-            "INSERT OR REPLACE INTO stream_heads (stream_id, stream_hash, collision_slot, last_rev, last_pos)
-             VALUES (?, ?, 0, ?, ?)",
-            params![stream_id, stream_hash.as_raw(), count as i64, last_pos as i64],
+            "INSERT OR REPLACE INTO stream_heads (stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos)
+             VALUES (?, ?, ?, 0, ?, ?)",
+            params![stream_id, stream_hash.as_raw(), crate::types::TenantHash::default_hash().as_raw(), count as i64, last_pos as i64],
         )
         .unwrap();
     }
