@@ -34,12 +34,13 @@
 //! cached stream_heads would return stale data. By using direct SQL queries,
 //! we always read the latest committed data from the database file.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::codec::decode_event_data;
+use crate::codec::decode_batch;
 use crate::crypto::{BatchCryptor, AES_GCM_NONCE_SIZE};
 use crate::error::Result;
 use crate::tombstones::{
@@ -133,7 +134,7 @@ pub fn read_stream(
     let tombstones = load_stream_tombstones(conn, stream_hash, collision_slot_typed)?;
 
     let mut stmt = conn.prepare(
-        "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev, b.batch_id, b.created_ms, b.nonce, b.data
+        "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev, b.base_pos, b.created_ms, b.nonce, b.data
          FROM event_index e
          JOIN batches b ON e.batch_id = b.batch_id
          WHERE e.stream_hash = ? AND e.collision_slot = ? AND e.stream_rev >= ?
@@ -153,27 +154,40 @@ pub fn read_stream(
             let byte_offset: i64 = row.get(1)?;
             let byte_len: i64 = row.get(2)?;
             let stream_rev: i64 = row.get(3)?;
-            let batch_id: i64 = row.get(4)?;
+            let base_pos: i64 = row.get(4)?;
             let timestamp_ms: i64 = row.get(5)?;
             let nonce: Vec<u8> = row.get(6)?;
             let batch_data: Vec<u8> = row.get(7)?;
 
-            Ok((global_pos, byte_offset, byte_len, stream_rev, batch_id, timestamp_ms, nonce, batch_data))
+            Ok((global_pos, byte_offset, byte_len, stream_rev, base_pos, timestamp_ms, nonce, batch_data))
         },
     )?;
 
+    // Cache decrypted batches to avoid O(n) decryption per batch
+    let mut batch_cache: HashMap<i64, Vec<u8>> = HashMap::new();
     let mut result = Vec::new();
     for event_data in events {
-        let (global_pos, byte_offset, byte_len, stream_rev, batch_id, timestamp_ms, nonce, batch_data) = event_data?;
+        let (global_pos, byte_offset, byte_len, stream_rev, base_pos, timestamp_ms, nonce, batch_data) = event_data?;
 
-        let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce.as_slice().try_into()
-            .map_err(|_| crate::error::Error::Encryption("invalid nonce length".into()))?;
-        let data = decode_event_data(&batch_data, &nonce_arr, batch_id, byte_offset as usize, byte_len as usize, cryptor)?;
+        // Check cache or decrypt the batch once
+        let decrypted = if let Some(cached) = batch_cache.get(&base_pos) {
+            cached
+        } else {
+            let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce.as_slice().try_into()
+                .map_err(|_| crate::error::Error::Encryption("invalid nonce length".into()))?;
+            let decrypted = decode_batch(&batch_data, &nonce_arr, base_pos, cryptor)?;
+            batch_cache.insert(base_pos, decrypted);
+            batch_cache.get(&base_pos).unwrap()
+        };
+
+        // Extract event data from cached decrypted batch
+        let data = decrypted[byte_offset as usize..byte_offset as usize + byte_len as usize].to_vec();
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
             stream_id: stream_id.clone(),
             tenant_hash,
+            collision_slot: collision_slot_typed,
             stream_rev: StreamRev::from_raw(stream_rev as u64),
             timestamp_ms: timestamp_ms as u64,
             data,
@@ -205,10 +219,10 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize, cryptor
     // Join with stream_heads to get stream_id and tenant_hash
     let mut stmt = conn.prepare(
         "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev,
-                b.batch_id, b.created_ms, b.nonce, b.data, s.stream_id, s.tenant_hash, s.collision_slot
+                b.base_pos, b.created_ms, b.nonce, b.data, s.stream_id, s.tenant_hash, s.collision_slot
          FROM event_index e
          JOIN batches b ON e.batch_id = b.batch_id
-         JOIN stream_heads s ON e.stream_hash = s.stream_hash AND e.collision_slot = s.collision_slot
+         JOIN stream_heads s ON e.stream_hash = s.stream_hash AND e.collision_slot = s.collision_slot AND e.tenant_hash = s.tenant_hash
          WHERE e.global_pos >= ?
          ORDER BY e.global_pos
          LIMIT ?",
@@ -219,7 +233,7 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize, cryptor
         let byte_offset: i64 = row.get(1)?;
         let byte_len: i64 = row.get(2)?;
         let stream_rev: i64 = row.get(3)?;
-        let batch_id: i64 = row.get(4)?;
+        let base_pos: i64 = row.get(4)?;
         let timestamp_ms: i64 = row.get(5)?;
         let nonce: Vec<u8> = row.get(6)?;
         let batch_data: Vec<u8> = row.get(7)?;
@@ -227,21 +241,34 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize, cryptor
         let tenant_hash: i64 = row.get(9)?;
         let collision_slot: i64 = row.get(10)?;
 
-        Ok((global_pos, byte_offset, byte_len, stream_rev, batch_id, timestamp_ms, nonce, batch_data, stream_id, tenant_hash, collision_slot))
+        Ok((global_pos, byte_offset, byte_len, stream_rev, base_pos, timestamp_ms, nonce, batch_data, stream_id, tenant_hash, collision_slot))
     })?;
 
+    // Cache decrypted batches to avoid O(n) decryption per batch
+    let mut batch_cache: HashMap<i64, Vec<u8>> = HashMap::new();
     let mut result = Vec::new();
     for event_data in events {
-        let (global_pos, byte_offset, byte_len, stream_rev, batch_id, timestamp_ms, nonce, batch_data, stream_id, tenant_hash, _collision_slot) = event_data?;
+        let (global_pos, byte_offset, byte_len, stream_rev, base_pos, timestamp_ms, nonce, batch_data, stream_id, tenant_hash, collision_slot) = event_data?;
 
-        let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce.as_slice().try_into()
-            .map_err(|_| crate::error::Error::Encryption("invalid nonce length".into()))?;
-        let data = decode_event_data(&batch_data, &nonce_arr, batch_id, byte_offset as usize, byte_len as usize, cryptor)?;
+        // Check cache or decrypt the batch once
+        let decrypted = if let Some(cached) = batch_cache.get(&base_pos) {
+            cached
+        } else {
+            let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce.as_slice().try_into()
+                .map_err(|_| crate::error::Error::Encryption("invalid nonce length".into()))?;
+            let decrypted = decode_batch(&batch_data, &nonce_arr, base_pos, cryptor)?;
+            batch_cache.insert(base_pos, decrypted);
+            batch_cache.get(&base_pos).unwrap()
+        };
+
+        // Extract event data from cached decrypted batch
+        let data = decrypted[byte_offset as usize..byte_offset as usize + byte_len as usize].to_vec();
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
             stream_id: StreamId::new(stream_id),
             tenant_hash: TenantHash::from_raw(tenant_hash),
+            collision_slot: CollisionSlot::from_raw(collision_slot as u16),
             stream_rev: StreamRev::from_raw(stream_rev as u64),
             timestamp_ms: timestamp_ms as u64,
             data,
@@ -292,10 +319,10 @@ pub fn read_tenant_events(
 
     let mut stmt = conn.prepare(
         "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev,
-                b.batch_id, b.created_ms, b.nonce, b.data, s.stream_id
+                b.base_pos, b.created_ms, b.nonce, b.data, s.stream_id, s.collision_slot
          FROM event_index e
          JOIN batches b ON e.batch_id = b.batch_id
-         JOIN stream_heads s ON e.stream_hash = s.stream_hash AND e.collision_slot = s.collision_slot
+         JOIN stream_heads s ON e.stream_hash = s.stream_hash AND e.collision_slot = s.collision_slot AND e.tenant_hash = s.tenant_hash
          WHERE e.tenant_hash = ? AND e.global_pos >= ?
          ORDER BY e.global_pos
          LIMIT ?",
@@ -308,28 +335,42 @@ pub fn read_tenant_events(
             let byte_offset: i64 = row.get(1)?;
             let byte_len: i64 = row.get(2)?;
             let stream_rev: i64 = row.get(3)?;
-            let batch_id: i64 = row.get(4)?;
+            let base_pos: i64 = row.get(4)?;
             let timestamp_ms: i64 = row.get(5)?;
             let nonce: Vec<u8> = row.get(6)?;
             let batch_data: Vec<u8> = row.get(7)?;
             let stream_id: String = row.get(8)?;
+            let collision_slot: i64 = row.get(9)?;
 
-            Ok((global_pos, byte_offset, byte_len, stream_rev, batch_id, timestamp_ms, nonce, batch_data, stream_id))
+            Ok((global_pos, byte_offset, byte_len, stream_rev, base_pos, timestamp_ms, nonce, batch_data, stream_id, collision_slot))
         },
     )?;
 
+    // Cache decrypted batches to avoid O(n) decryption per batch
+    let mut batch_cache: HashMap<i64, Vec<u8>> = HashMap::new();
     let mut result = Vec::new();
     for event_data in events {
-        let (global_pos, byte_offset, byte_len, stream_rev, batch_id, timestamp_ms, nonce, batch_data, stream_id) = event_data?;
+        let (global_pos, byte_offset, byte_len, stream_rev, base_pos, timestamp_ms, nonce, batch_data, stream_id, collision_slot) = event_data?;
 
-        let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce.as_slice().try_into()
-            .map_err(|_| crate::error::Error::Encryption("invalid nonce length".into()))?;
-        let data = decode_event_data(&batch_data, &nonce_arr, batch_id, byte_offset as usize, byte_len as usize, cryptor)?;
+        // Check cache or decrypt the batch once
+        let decrypted = if let Some(cached) = batch_cache.get(&base_pos) {
+            cached
+        } else {
+            let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce.as_slice().try_into()
+                .map_err(|_| crate::error::Error::Encryption("invalid nonce length".into()))?;
+            let decrypted = decode_batch(&batch_data, &nonce_arr, base_pos, cryptor)?;
+            batch_cache.insert(base_pos, decrypted);
+            batch_cache.get(&base_pos).unwrap()
+        };
+
+        // Extract event data from cached decrypted batch
+        let data = decrypted[byte_offset as usize..byte_offset as usize + byte_len as usize].to_vec();
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
             stream_id: StreamId::new(stream_id),
             tenant_hash,
+            collision_slot: CollisionSlot::from_raw(collision_slot as u16),
             stream_rev: StreamRev::from_raw(stream_rev as u64),
             timestamp_ms: timestamp_ms as u64,
             data,

@@ -253,12 +253,7 @@ pub fn filter_all_tombstones(
     for event in events {
         // Get stream hash and collision slot for this event
         let stream_hash = event.stream_id.hash();
-        // Note: We don't have collision_slot on Event, so we use 0 as default.
-        // In production, you'd want to either:
-        // 1. Add collision_slot to Event
-        // 2. Look it up from stream_heads
-        // For now, using CollisionSlot::FIRST is safe for most cases.
-        let collision_slot = CollisionSlot::FIRST;
+        let collision_slot = event.collision_slot;
 
         let key = (stream_hash, collision_slot);
 
@@ -520,6 +515,7 @@ mod tests {
                 global_pos: GlobalPos::FIRST,
                 stream_id: StreamId::new("stream-1"),
                 tenant_hash: TenantHash::from_raw(100), // deleted
+                collision_slot: CollisionSlot::FIRST,
                 stream_rev: StreamRev::from_raw(1),
                 timestamp_ms: 1000,
                 data: vec![1],
@@ -528,6 +524,7 @@ mod tests {
                 global_pos: GlobalPos::from_raw(2),
                 stream_id: StreamId::new("stream-2"),
                 tenant_hash: TenantHash::from_raw(200), // not deleted
+                collision_slot: CollisionSlot::FIRST,
                 stream_rev: StreamRev::from_raw(1),
                 timestamp_ms: 1000,
                 data: vec![2],

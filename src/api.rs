@@ -202,23 +202,7 @@ impl SpiteDB {
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let cryptor = BatchCryptor::from_env()?;
         let path = path.as_ref().to_path_buf();
-        Self::open_internal(Some(path), cryptor).await
-    }
-
-    /// Creates a SpiteDB instance with an in-memory database.
-    ///
-    /// # Use Case
-    ///
-    /// Primarily for testing. In-memory databases don't persist across restarts.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let db = SpiteDB::open_in_memory().await?;
-    /// ```
-    pub async fn open_in_memory() -> Result<Self> {
-        let cryptor = BatchCryptor::from_env()?;
-        Self::open_in_memory_with_cryptor(cryptor).await
+        Self::open_internal(path, cryptor).await
     }
 
     /// Opens a file-based database with a custom cryptor.
@@ -228,62 +212,41 @@ impl SpiteDB {
     /// For dependency injection or testing with custom key providers.
     pub async fn open_with_cryptor<P: AsRef<Path>>(path: P, cryptor: BatchCryptor) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        Self::open_internal(Some(path), cryptor).await
+        Self::open_internal(path, cryptor).await
     }
 
-    /// Creates an in-memory database with a custom cryptor.
-    ///
-    /// # Use Case
-    ///
-    /// For testing without requiring environment variables.
-    pub async fn open_in_memory_with_cryptor(cryptor: BatchCryptor) -> Result<Self> {
-        Self::open_internal(None, cryptor).await
-    }
-
-    /// Internal implementation that handles both file and in-memory databases.
-    async fn open_internal(path: Option<PathBuf>, cryptor: BatchCryptor) -> Result<Self> {
+    /// Internal implementation for file-based databases.
+    async fn open_internal(path: PathBuf, cryptor: BatchCryptor) -> Result<Self> {
         // Clone the cryptor for readers (they need their own instance)
         let reader_cryptor = Arc::new(cryptor.clone_with_same_key());
 
         // Create read channel
         let (read_tx, read_rx) = mpsc::channel(READ_CHANNEL_SIZE);
 
-        // Clone path for reader threads
-        let read_path = path.clone();
-
         // Initialize the database and spawn the batch writer
-        let db = match &path {
-            Some(p) => Database::open(p)?,
-            None => Database::open_in_memory()?,
-        };
+        let db = Database::open(&path)?;
 
         // Spawn batch writer with default config (10ms batch timeout)
         let writer = spawn_batch_writer(db.into_connection(), cryptor, WriterConfig::default())?;
 
         // Determine reader thread count based on available CPUs
-        // For in-memory databases, we use 1 thread (can't share the connection)
-        let reader_count = if read_path.is_some() {
-            available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(MIN_READ_THREADS)
-                .clamp(MIN_READ_THREADS, MAX_READ_THREADS)
-        } else {
-            // In-memory databases can only have one connection
-            1
-        };
+        let reader_count = available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(MIN_READ_THREADS)
+            .clamp(MIN_READ_THREADS, MAX_READ_THREADS);
 
         // Wrap the receiver in Arc<std::sync::Mutex> for sharing across threads
         // Threads compete to receive from the channel (simple load balancing)
         let read_rx = Arc::new(std::sync::Mutex::new(read_rx));
 
         // Spawn reader thread pool
-        // For file-based databases, each thread opens its own read-only connection.
+        // Each thread opens its own read-only connection.
         // This ensures readers always see the latest committed data via WAL mode.
         let mut reader_handles = Vec::with_capacity(reader_count);
 
         for i in 0..reader_count {
             let rx = Arc::clone(&read_rx);
-            let path = read_path.clone();
+            let reader_path = path.clone();
             let cryptor = Arc::clone(&reader_cryptor);
 
             let handle = thread::Builder::new()
@@ -295,25 +258,13 @@ impl SpiteDB {
                         .expect("failed to create reader runtime");
 
                     rt.block_on(async {
-                        match path {
-                            Some(p) => {
-                                // File-based: each thread opens its own read-only connection
-                                let conn = Connection::open_with_flags(
-                                    &p,
-                                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                                )
-                                .expect("failed to open read-only connection");
-                                reader::run_reader_pooled(conn, cryptor, rx).await;
-                            }
-                            None => {
-                                // In-memory: create a separate in-memory DB for reads
-                                // Note: This won't see writes from the writer for in-memory DBs.
-                                // In-memory mode is primarily for testing the writer.
-                                let db =
-                                    Database::open_in_memory().expect("failed to open in-memory db");
-                                reader::run_reader_pooled(db.into_connection(), cryptor, rx).await;
-                            }
-                        }
+                        // Each thread opens its own read-only connection
+                        let conn = Connection::open_with_flags(
+                            &reader_path,
+                            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                        )
+                        .expect("failed to open read-only connection");
+                        reader::run_reader_pooled(conn, cryptor, rx).await;
                     });
                 })
                 .map_err(|e| Error::Schema(format!("failed to spawn reader thread: {}", e)))?;
@@ -610,15 +561,24 @@ mod tests {
         BatchCryptor::new(EnvKeyProvider::from_key(key))
     }
 
+    /// Creates a test database in a temporary directory.
+    /// Returns (db, temp_dir) - temp_dir must be kept alive for the db to work.
+    async fn test_db() -> (SpiteDB, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = SpiteDB::open_with_cryptor(&db_path, test_cryptor()).await.unwrap();
+        (db, temp_dir)
+    }
+
     #[tokio::test]
-    async fn test_open_in_memory() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+    async fn test_open() {
+        let (db, _temp_dir) = test_db().await;
         db.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_append_single() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         let cmd = AppendCommand::new(
             "cmd-1",
@@ -635,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_multiple() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         for i in 0..10 {
             let cmd = AppendCommand::new(
@@ -654,7 +614,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conflict_detection() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         // First append
         let cmd1 = AppendCommand::new(
@@ -681,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idempotency() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         let cmd = AppendCommand::new(
             "cmd-idem",
@@ -701,7 +661,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_appends() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         // Spawn multiple tasks that append concurrently
         let mut handles = vec![];
@@ -780,7 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clone_and_share() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         // Clone for multiple tasks
         let db1 = db.clone();
@@ -920,7 +880,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_stream_nonexistent() {
-        let db = SpiteDB::open_in_memory_with_cryptor(test_cryptor()).await.unwrap();
+        let (db, _temp_dir) = test_db().await;
 
         // Try to delete a non-existent stream
         let result = db.delete_stream("delete-cmd", "nonexistent").await;

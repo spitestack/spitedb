@@ -612,6 +612,11 @@ pub struct Event {
     /// The tenant this event belongs to (hashed).
     pub tenant_hash: TenantHash,
 
+    /// Collision slot for hash collision disambiguation.
+    /// Usually 0 for most streams; only non-zero when multiple streams
+    /// have the same hash (extremely rare with 64-bit hashes).
+    pub collision_slot: CollisionSlot,
+
     /// Revision within the stream.
     pub stream_rev: StreamRev,
 

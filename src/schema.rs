@@ -177,7 +177,7 @@ CREATE TABLE IF NOT EXISTS event_index (
 /// - Uniqueness constraint preventing duplicate events
 const CREATE_EVENT_STREAM_INDEX: &str = r#"
 CREATE UNIQUE INDEX IF NOT EXISTS event_stream_rev
-ON event_index(stream_hash, collision_slot, stream_rev)
+ON event_index(tenant_hash, stream_hash, collision_slot, stream_rev)
 "#;
 
 /// The `stream_heads` table caches the latest revision for each stream.
@@ -228,12 +228,13 @@ ON event_index(stream_hash, collision_slot, stream_rev)
 /// The table serves as the source of truth; memory cache can lag but never lead.
 const CREATE_STREAM_HEADS: &str = r#"
 CREATE TABLE IF NOT EXISTS stream_heads (
-    stream_id      TEXT PRIMARY KEY,
+    stream_id      TEXT NOT NULL,
     stream_hash    INTEGER NOT NULL,
     tenant_hash    INTEGER NOT NULL,
     collision_slot INTEGER NOT NULL DEFAULT 0,
     last_rev       INTEGER NOT NULL,
-    last_pos       INTEGER NOT NULL
+    last_pos       INTEGER NOT NULL,
+    PRIMARY KEY (stream_id, tenant_hash)
 )
 "#;
 

@@ -2,7 +2,6 @@
 //!
 //! The registry provides a central point for:
 //! - Registering projections
-//! - Starting/stopping consumers
 //! - Getting projection instances for direct operations
 
 use std::collections::HashMap;
@@ -106,60 +105,13 @@ impl ProjectionRegistry {
 
     /// Unregisters a projection.
     ///
-    /// Stops the consumer if running and removes it from the registry.
-    /// Does NOT delete the database file.
-    pub async fn unregister(&mut self, name: &str) -> Result<(), ProjectionError> {
-        let mut consumer = self
-            .consumers
+    /// Removes it from the registry. Does NOT delete the database file.
+    pub fn unregister(&mut self, name: &str) -> Result<(), ProjectionError> {
+        self.consumers
             .remove(name)
             .ok_or_else(|| ProjectionError::NotFound(name.to_string()))?;
 
-        // Stop if running
-        if consumer.is_running() {
-            consumer.stop().await;
-        }
-
         Ok(())
-    }
-
-    // =========================================================================
-    // Consumer Lifecycle (Rust-native mode)
-    // =========================================================================
-
-    /// Starts a specific projection consumer with a Rust apply function.
-    pub async fn start<F>(&mut self, name: &str, apply_fn: F) -> Result<(), ProjectionError>
-    where
-        F: Fn(&[spitedb::Event]) -> Vec<ProjectionOp> + Send + Sync + 'static,
-    {
-        let consumer = self
-            .consumers
-            .get_mut(name)
-            .ok_or_else(|| ProjectionError::NotFound(name.to_string()))?;
-
-        consumer.start(apply_fn).await
-    }
-
-    /// Stops a specific projection consumer.
-    pub async fn stop(&mut self, name: &str) -> Result<(), ProjectionError> {
-        let consumer = self
-            .consumers
-            .get_mut(name)
-            .ok_or_else(|| ProjectionError::NotFound(name.to_string()))?;
-
-        consumer.stop().await;
-        Ok(())
-    }
-
-    /// Stops all consumers.
-    pub async fn stop_all(&mut self) {
-        for consumer in self.consumers.values_mut() {
-            consumer.stop().await;
-        }
-    }
-
-    /// Returns whether a consumer is running.
-    pub fn is_running(&self, name: &str) -> Option<bool> {
-        self.consumers.get(name).map(|c| c.is_running())
     }
 
     // =========================================================================
@@ -259,7 +211,8 @@ mod tests {
     #[tokio::test]
     async fn test_registry_lifecycle() {
         let temp_dir = TempDir::new().unwrap();
-        let event_store = Arc::new(SpiteDB::open_in_memory().await.unwrap());
+        let db_path = temp_dir.path().join("events.db");
+        let event_store = Arc::new(SpiteDB::open(&db_path).await.unwrap());
 
         let mut registry =
             ProjectionRegistry::new(temp_dir.path().to_path_buf(), event_store).unwrap();
@@ -281,7 +234,7 @@ mod tests {
         assert!(temp_dir.path().join("proj_b.db").exists());
 
         // Unregister
-        registry.unregister("proj_a").await.unwrap();
+        registry.unregister("proj_a").unwrap();
         assert_eq!(registry.len(), 1);
         assert!(!registry.contains("proj_a"));
 
@@ -292,7 +245,8 @@ mod tests {
     #[tokio::test]
     async fn test_registry_js_driven_mode() {
         let temp_dir = TempDir::new().unwrap();
-        let event_store = Arc::new(SpiteDB::open_in_memory().await.unwrap());
+        let db_path = temp_dir.path().join("events.db");
+        let event_store = Arc::new(SpiteDB::open(&db_path).await.unwrap());
 
         let mut registry =
             ProjectionRegistry::new(temp_dir.path().to_path_buf(), event_store).unwrap();
@@ -322,7 +276,8 @@ mod tests {
     #[tokio::test]
     async fn test_registry_multiple_projections_independent() {
         let temp_dir = TempDir::new().unwrap();
-        let event_store = Arc::new(SpiteDB::open_in_memory().await.unwrap());
+        let db_path = temp_dir.path().join("events.db");
+        let event_store = Arc::new(SpiteDB::open(&db_path).await.unwrap());
 
         let mut registry =
             ProjectionRegistry::new(temp_dir.path().to_path_buf(), event_store).unwrap();

@@ -47,19 +47,6 @@ impl SpiteDBNapi {
         })
     }
 
-    /// Opens an in-memory SpiteDB database.
-    #[napi(factory)]
-    pub async fn open_in_memory() -> Result<Self> {
-        let db = SpiteDB::open_in_memory()
-            .await
-            .map_err(|e| Error::from_reason(format!("Failed to open database: {}", e)))?;
-
-        Ok(Self {
-            inner: Arc::new(db),
-            projection_registry: Arc::new(Mutex::new(None)),
-        })
-    }
-
     /// Appends events to a stream.
     ///
     /// @param streamId - The stream to append to

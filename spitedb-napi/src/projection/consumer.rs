@@ -1,21 +1,14 @@
 //! Projection consumer - async event processing for a single projection.
 //!
-//! The consumer manages event consumption for one projection. It can operate in two modes:
+//! The consumer manages event consumption for one projection using JS-driven mode:
+//! JavaScript polls for events, processes them, and sends operations back.
 //!
-//! 1. **JS-driven mode**: JavaScript polls for events, processes them, and sends operations back.
-//!    This is simpler and matches the existing pattern.
-//!
-//! 2. **Rust-native mode**: A Rust async task consumes events and applies them via a callback.
-//!    This provides true push semantics with better latency.
-//!
-//! Both modes use the same underlying `ProjectionInstance` for SQLite operations.
+//! The consumer uses a `ProjectionInstance` for SQLite operations.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 use spitedb::{GlobalPos, SpiteDB};
 
@@ -65,7 +58,6 @@ impl ProjectionConsumerConfig {
 ///
 /// Each consumer has:
 /// - Its own `ProjectionInstance` (separate SQLite database)
-/// - An optional async task for Rust-native consumption
 /// - Methods for JS-driven consumption
 pub struct ProjectionConsumer {
     /// The projection instance (owns the SQLite database).
@@ -74,14 +66,8 @@ pub struct ProjectionConsumer {
     /// Configuration.
     config: ProjectionConsumerConfig,
 
-    /// Reference to the event store (for reading events and subscribing).
+    /// Reference to the event store (for reading events).
     event_store: Arc<SpiteDB>,
-
-    /// Whether the Rust consumer task is running.
-    running: Arc<AtomicBool>,
-
-    /// Handle to the consumer task (if started in Rust-native mode).
-    task_handle: Option<JoinHandle<()>>,
 }
 
 impl ProjectionConsumer {
@@ -98,8 +84,6 @@ impl ProjectionConsumer {
             instance: Arc::new(Mutex::new(instance)),
             config,
             event_store,
-            running: Arc::new(AtomicBool::new(false)),
-            task_handle: None,
         })
     }
 
@@ -192,162 +176,6 @@ impl ProjectionConsumer {
         let batch_id = from_pos.as_raw() as i64;
         Ok(Some((events, batch_id)))
     }
-
-    // =========================================================================
-    // Rust-Native Mode
-    // =========================================================================
-
-    /// Returns whether the Rust consumer task is running.
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
-    /// Starts the Rust-native consumer task.
-    ///
-    /// The consumer will:
-    /// 1. Load the checkpoint from the projection database
-    /// 2. Create a catch-up subscription from that position
-    /// 3. Process events using the provided apply function
-    /// 4. Write results to the projection database via spawn_blocking
-    ///
-    /// The `apply_fn` receives events and returns operations to apply.
-    pub async fn start<F>(&mut self, apply_fn: F) -> Result<(), ProjectionError>
-    where
-        F: Fn(&[spitedb::Event]) -> Vec<ProjectionOp> + Send + Sync + 'static,
-    {
-        if self.running.load(Ordering::SeqCst) {
-            return Err(ProjectionError::AlreadyRunning(self.config.name.clone()));
-        }
-
-        // Get starting checkpoint
-        let checkpoint = self.get_checkpoint().await?;
-        let start_pos = checkpoint
-            .map(|p| GlobalPos::from_raw((p + 1) as u64))
-            .unwrap_or(GlobalPos::FIRST);
-
-        // Create catch-up subscription
-        let subscription = self
-            .event_store
-            .subscribe_from(start_pos)
-            .await
-            .map_err(|e| ProjectionError::Internal(format!("Subscribe error: {}", e)))?;
-
-        // Spawn consumer task
-        let instance = Arc::clone(&self.instance);
-        let running = Arc::clone(&self.running);
-        let batch_size = self.config.batch_size;
-        let name = self.config.name.clone();
-
-        running.store(true, Ordering::SeqCst);
-
-        let handle = tokio::spawn(async move {
-            run_consumer_loop(instance, subscription, apply_fn, running, batch_size, &name).await;
-        });
-
-        self.task_handle = Some(handle);
-
-        Ok(())
-    }
-
-    /// Stops the Rust-native consumer task.
-    pub async fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-
-        if let Some(handle) = self.task_handle.take() {
-            // The task should exit on its own when running becomes false
-            // but we can abort if needed
-            handle.abort();
-            let _ = handle.await;
-        }
-    }
-}
-
-/// Internal consumer loop for Rust-native mode.
-async fn run_consumer_loop<F>(
-    instance: Arc<Mutex<ProjectionInstance>>,
-    mut subscription: spitedb::subscription::CatchUpSubscription,
-    apply_fn: F,
-    running: Arc<AtomicBool>,
-    batch_size: usize,
-    name: &str,
-) where
-    F: Fn(&[spitedb::Event]) -> Vec<ProjectionOp> + Send + Sync + 'static,
-{
-    let mut batch: Vec<spitedb::Event> = Vec::with_capacity(batch_size);
-
-    while running.load(Ordering::SeqCst) {
-        match subscription.next().await {
-            Some(Ok(event)) => {
-                batch.push(event);
-
-                // Process when batch is full
-                if batch.len() >= batch_size {
-                    if let Err(e) = process_batch(&instance, &batch, &apply_fn).await {
-                        eprintln!("Projection {} batch error: {}", name, e);
-                        // On error, we stop - could add retry logic here
-                        break;
-                    }
-                    batch.clear();
-                }
-            }
-            Some(Err(spitedb::error::Error::SubscriptionLagged(n))) => {
-                eprintln!("Projection {} subscription lagged by {} events", name, n);
-                // Could restart subscription from checkpoint here
-                break;
-            }
-            Some(Err(e)) => {
-                eprintln!("Projection {} subscription error: {}", name, e);
-                break;
-            }
-            None => {
-                // Subscription closed
-                break;
-            }
-        }
-    }
-
-    // Process any remaining events
-    if !batch.is_empty() && running.load(Ordering::SeqCst) {
-        if let Err(e) = process_batch(&instance, &batch, &apply_fn).await {
-            eprintln!("Projection {} final batch error: {}", name, e);
-        }
-    }
-
-    running.store(false, Ordering::SeqCst);
-}
-
-/// Processes a batch of events through the apply function and writes to SQLite.
-async fn process_batch<F>(
-    instance: &Arc<Mutex<ProjectionInstance>>,
-    events: &[spitedb::Event],
-    apply_fn: &F,
-) -> Result<(), ProjectionError>
-where
-    F: Fn(&[spitedb::Event]) -> Vec<ProjectionOp>,
-{
-    if events.is_empty() {
-        return Ok(());
-    }
-
-    // Apply function to get operations
-    let operations = apply_fn(events);
-
-    // Get checkpoint from last event
-    let checkpoint = events
-        .last()
-        .map(|e| e.global_pos.as_raw() as i64)
-        .unwrap_or(0);
-
-    // Write to SQLite via spawn_blocking
-    let instance = Arc::clone(instance);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = instance.blocking_lock();
-        guard.apply_batch(operations, checkpoint)
-    })
-    .await
-    .map_err(|e| ProjectionError::Internal(format!("Task join error: {}", e)))??;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -382,7 +210,8 @@ mod tests {
     #[tokio::test]
     async fn test_consumer_js_driven_mode() {
         let temp_dir = TempDir::new().unwrap();
-        let event_store = Arc::new(SpiteDB::open_in_memory().await.unwrap());
+        let db_path = temp_dir.path().join("events.db");
+        let event_store = Arc::new(SpiteDB::open(&db_path).await.unwrap());
 
         let config = ProjectionConsumerConfig::new("test", temp_dir.path().to_path_buf(), create_test_schema());
         let consumer = ProjectionConsumer::new(config, event_store).unwrap();

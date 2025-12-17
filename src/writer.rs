@@ -713,7 +713,7 @@ impl BatchWriter {
         self.conn.execute(
             "INSERT INTO stream_heads (stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos)
              VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(stream_id) DO UPDATE SET
+             ON CONFLICT(stream_id, tenant_hash) DO UPDATE SET
                  last_rev = excluded.last_rev,
                  last_pos = excluded.last_pos",
             params![
