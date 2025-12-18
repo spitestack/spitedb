@@ -289,7 +289,27 @@ CREATE TABLE IF NOT EXISTS commands (
     stream_hash INTEGER NOT NULL,
     first_pos   INTEGER NOT NULL,
     last_pos    INTEGER NOT NULL,
+    first_rev   INTEGER NOT NULL,
+    last_rev    INTEGER NOT NULL,
     created_ms  INTEGER NOT NULL
+)
+"#;
+
+/// The `delete_commands` table tracks processed delete commands for idempotency.
+///
+/// # Exactly-Once Semantics for Deletes
+///
+/// Every delete command includes a client-supplied `command_id`. If we see the
+/// same command_id again, we return the stored result instead of creating
+/// duplicate tombstones.
+const CREATE_DELETE_COMMANDS: &str = r#"
+CREATE TABLE IF NOT EXISTS delete_commands (
+    command_id  TEXT PRIMARY KEY,
+    stream_hash INTEGER NOT NULL,
+    tenant_hash INTEGER NOT NULL,
+    from_rev    INTEGER NOT NULL,
+    to_rev      INTEGER NOT NULL,
+    deleted_ms  INTEGER NOT NULL
 )
 "#;
 
@@ -324,6 +344,7 @@ const CREATE_TOMBSTONES: &str = r#"
 CREATE TABLE IF NOT EXISTS tombstones (
     stream_hash    INTEGER NOT NULL,
     collision_slot INTEGER NOT NULL DEFAULT 0,
+    tenant_hash    INTEGER NOT NULL,
     from_rev       INTEGER NOT NULL,
     to_rev         INTEGER NOT NULL,
     deleted_ms     INTEGER NOT NULL
@@ -568,15 +589,24 @@ impl Database {
         // This allows readers to see a consistent snapshot while writes happen.
         self.conn.execute_batch("PRAGMA journal_mode = WAL")?;
 
-        // Synchronous = NORMAL: Sync WAL on commit, but not every write
-        // Trade-off: Slightly less durable (could lose last transaction on OS crash)
-        // but significantly faster. For event stores, this is usually acceptable
-        // since the client can retry on failure.
-        self.conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        // Synchronous = FULL: Full fsync on every commit, maximum durability.
+        // This is the safe default for production.
+        self.conn.execute_batch("PRAGMA synchronous = FULL")?;
 
         // Foreign keys: We don't use FK constraints (for performance), but
         // enable them anyway for safety during development.
         self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
+
+        // Cache size: 64MB page cache (negative = KB, so -65536 = 64MB)
+        // Larger cache reduces disk I/O for B-tree operations
+        self.conn.execute_batch("PRAGMA cache_size = -65536")?;
+
+        // Temp store in memory: Keep temporary tables and indices in RAM
+        self.conn.execute_batch("PRAGMA temp_store = MEMORY")?;
+
+        // Memory-mapped I/O: Map up to 1GB of database file into memory
+        // Improves read performance by avoiding read() syscalls
+        self.conn.execute_batch("PRAGMA mmap_size = 1073741824")?;
 
         // =====================================================================
         // Create Tables
@@ -591,6 +621,7 @@ impl Database {
         self.conn.execute_batch(CREATE_STREAM_HEADS_HASH_INDEX)?;
         self.conn.execute_batch(CREATE_STREAM_HEADS_TENANT_INDEX)?;
         self.conn.execute_batch(CREATE_COMMANDS)?;
+        self.conn.execute_batch(CREATE_DELETE_COMMANDS)?;
         // Tenant projection tables
         self.conn.execute_batch(CREATE_TENANT_EVENT_INDEX)?;
         self.conn.execute_batch(CREATE_TENANT_EVENT_STREAM_INDEX)?;
@@ -721,9 +752,9 @@ mod tests {
             )
             .expect("should query tables");
 
-        // We expect 9 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
-        // tenant_event_index, tenant_projection_checkpoint, tenant_tombstones
-        assert_eq!(count, 9, "expected 9 tables");
+        // We expect 10 tables: metadata, batches, event_index, stream_heads, commands, delete_commands,
+        // tombstones, tenant_event_index, tenant_projection_checkpoint, tenant_tombstones
+        assert_eq!(count, 10, "expected 10 tables");
     }
 
     /// Verify that indexes are created.
@@ -797,9 +828,9 @@ mod tests {
                 )
                 .expect("should query");
 
-            // We expect 9 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
-            // tenant_event_index, tenant_projection_checkpoint, tenant_tombstones
-            assert_eq!(count, 9);
+            // We expect 10 tables: metadata, batches, event_index, stream_heads, commands, delete_commands,
+            // tombstones, tenant_event_index, tenant_projection_checkpoint, tenant_tombstones
+            assert_eq!(count, 10);
         }
     }
 }

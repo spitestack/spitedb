@@ -848,6 +848,9 @@ pub struct DeleteStreamCommand {
     /// The stream to delete events from.
     pub stream_id: StreamId,
 
+    /// The tenant this stream belongs to.
+    pub tenant: Tenant,
+
     /// First revision to delete (inclusive). None = from the beginning.
     pub from_rev: Option<StreamRev>,
 
@@ -857,10 +860,15 @@ pub struct DeleteStreamCommand {
 
 impl DeleteStreamCommand {
     /// Creates a command to delete all events from a stream.
-    pub fn delete_all(command_id: impl Into<CommandId>, stream_id: impl Into<StreamId>) -> Self {
+    pub fn delete_all(
+        command_id: impl Into<CommandId>,
+        stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
+    ) -> Self {
         Self {
             command_id: command_id.into(),
             stream_id: stream_id.into(),
+            tenant: tenant.into(),
             from_rev: None,
             to_rev: None,
         }
@@ -870,12 +878,14 @@ impl DeleteStreamCommand {
     pub fn delete_range(
         command_id: impl Into<CommandId>,
         stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
         from_rev: StreamRev,
         to_rev: StreamRev,
     ) -> Self {
         Self {
             command_id: command_id.into(),
             stream_id: stream_id.into(),
+            tenant: tenant.into(),
             from_rev: Some(from_rev),
             to_rev: Some(to_rev),
         }
@@ -944,6 +954,9 @@ pub struct StreamTombstone {
 
     /// Collision slot (matches event_index).
     pub collision_slot: CollisionSlot,
+
+    /// Hash of the tenant this tombstone belongs to.
+    pub tenant_hash: TenantHash,
 
     /// First revision that is tombstoned (inclusive).
     pub from_rev: StreamRev,

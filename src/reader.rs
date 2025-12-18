@@ -48,6 +48,25 @@ use crate::tombstones::{
     load_tenant_tombstones,
 };
 use crate::types::{CollisionSlot, Event, GlobalPos, StreamId, StreamRev, TenantHash};
+use crate::Error;
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Extracts event data from a decrypted batch with bounds checking.
+///
+/// Returns an error if the offset/length would go out of bounds, which indicates
+/// either database corruption or a bug in the event indexing logic.
+fn extract_event_data(decrypted: &[u8], offset: usize, len: usize, global_pos: u64) -> Result<Vec<u8>> {
+    if offset.checked_add(len).map_or(true, |end| end > decrypted.len()) {
+        return Err(Error::Schema(format!(
+            "corrupted event index: global_pos={} has invalid bounds (offset={}, len={}, batch_len={})",
+            global_pos, offset, len, decrypted.len()
+        )));
+    }
+    Ok(decrypted[offset..offset + len].to_vec())
+}
 
 // =============================================================================
 // Request Types
@@ -110,13 +129,15 @@ pub fn read_stream(
     let stream_hash = stream_id.hash();
 
     // Get collision slot and tenant_hash from stream_heads
-    let head_info: Option<(i64, i64)> = conn
-        .query_row(
-            "SELECT collision_slot, tenant_hash FROM stream_heads WHERE stream_id = ?",
-            [stream_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
+    let head_info: Option<(i64, i64)> = match conn.query_row(
+        "SELECT collision_slot, tenant_hash FROM stream_heads WHERE stream_id = ?",
+        [stream_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
 
     let (collision_slot, tenant_hash) = match head_info {
         Some((slot, tenant)) => (slot, TenantHash::from_raw(tenant)),
@@ -130,8 +151,8 @@ pub fn read_stream(
         return Ok(Vec::new());
     }
 
-    // Load tombstones for this stream
-    let tombstones = load_stream_tombstones(conn, stream_hash, collision_slot_typed)?;
+    // Load tombstones for this stream (tenant-scoped)
+    let tombstones = load_stream_tombstones(conn, stream_hash, collision_slot_typed, tenant_hash)?;
 
     let mut stmt = conn.prepare(
         "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev, b.base_pos, b.created_ms, b.nonce, b.data
@@ -180,8 +201,8 @@ pub fn read_stream(
             batch_cache.get(&base_pos).unwrap()
         };
 
-        // Extract event data from cached decrypted batch
-        let data = decrypted[byte_offset as usize..byte_offset as usize + byte_len as usize].to_vec();
+        // Extract event data from cached decrypted batch with bounds checking
+        let data = extract_event_data(decrypted, byte_offset as usize, byte_len as usize, global_pos as u64)?;
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
@@ -261,8 +282,8 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize, cryptor
             batch_cache.get(&base_pos).unwrap()
         };
 
-        // Extract event data from cached decrypted batch
-        let data = decrypted[byte_offset as usize..byte_offset as usize + byte_len as usize].to_vec();
+        // Extract event data from cached decrypted batch with bounds checking
+        let data = extract_event_data(decrypted, byte_offset as usize, byte_len as usize, global_pos as u64)?;
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
@@ -363,8 +384,8 @@ pub fn read_tenant_events(
             batch_cache.get(&base_pos).unwrap()
         };
 
-        // Extract event data from cached decrypted batch
-        let data = decrypted[byte_offset as usize..byte_offset as usize + byte_len as usize].to_vec();
+        // Extract event data from cached decrypted batch with bounds checking
+        let data = extract_event_data(decrypted, byte_offset as usize, byte_len as usize, global_pos as u64)?;
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),

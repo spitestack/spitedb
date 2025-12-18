@@ -38,13 +38,14 @@ use crate::types::{
 // Stream Tombstones
 // =============================================================================
 
-/// Loads all tombstones for a given stream.
+/// Loads all tombstones for a given stream within a specific tenant.
 ///
 /// # Arguments
 ///
 /// * `conn` - Database connection
 /// * `stream_hash` - Hash of the stream
 /// * `collision_slot` - Collision slot for the stream
+/// * `tenant_hash` - Hash of the tenant (for multi-tenant isolation)
 ///
 /// # Returns
 ///
@@ -53,15 +54,16 @@ pub fn load_stream_tombstones(
     conn: &Connection,
     stream_hash: StreamHash,
     collision_slot: CollisionSlot,
+    tenant_hash: TenantHash,
 ) -> Result<Vec<StreamTombstone>> {
     let mut stmt = conn.prepare(
         "SELECT from_rev, to_rev, deleted_ms
          FROM tombstones
-         WHERE stream_hash = ? AND collision_slot = ?",
+         WHERE stream_hash = ? AND collision_slot = ? AND tenant_hash = ?",
     )?;
 
     let tombstones = stmt.query_map(
-        params![stream_hash.as_raw(), collision_slot.as_raw() as i64],
+        params![stream_hash.as_raw(), collision_slot.as_raw() as i64, tenant_hash.as_raw()],
         |row| {
             let from_rev: i64 = row.get(0)?;
             let to_rev: i64 = row.get(1)?;
@@ -70,6 +72,7 @@ pub fn load_stream_tombstones(
             Ok(StreamTombstone {
                 stream_hash,
                 collision_slot,
+                tenant_hash,
                 from_rev: StreamRev::from_raw(from_rev as u64),
                 to_rev: StreamRev::from_raw(to_rev as u64),
                 deleted_ms: deleted_ms as u64,
@@ -244,23 +247,25 @@ pub fn filter_all_tombstones(
     // many streams, consider caching tombstones or batch loading.
     let mut filtered = Vec::with_capacity(events.len());
 
-    // Track which stream tombstones we've already loaded
+    // Track which stream tombstones we've already loaded (keyed by stream+slot+tenant)
     let mut stream_tombstones_cache: std::collections::HashMap<
-        (StreamHash, CollisionSlot),
+        (StreamHash, CollisionSlot, TenantHash),
         Vec<StreamTombstone>,
     > = std::collections::HashMap::new();
 
     for event in events {
-        // Get stream hash and collision slot for this event
+        // Get stream hash, collision slot, and tenant for this event
         let stream_hash = event.stream_id.hash();
         let collision_slot = event.collision_slot;
+        let tenant_hash = event.tenant_hash;
 
-        let key = (stream_hash, collision_slot);
+        // Include tenant in cache key for proper multi-tenant isolation
+        let key = (stream_hash, collision_slot, tenant_hash);
 
         let tombstones = if let Some(cached) = stream_tombstones_cache.get(&key) {
             cached
         } else {
-            let loaded = load_stream_tombstones(conn, stream_hash, collision_slot)?;
+            let loaded = load_stream_tombstones(conn, stream_hash, collision_slot, tenant_hash)?;
             stream_tombstones_cache.insert(key, loaded);
             stream_tombstones_cache.get(&key).unwrap()
         };
@@ -407,8 +412,9 @@ mod tests {
     fn test_load_stream_tombstones_empty() {
         let conn = setup_test_db();
         let stream_hash = StreamHash::from_raw(12345);
+        let tenant_hash = TenantHash::default_hash();
         let tombstones =
-            load_stream_tombstones(&conn, stream_hash, CollisionSlot::FIRST).unwrap();
+            load_stream_tombstones(&conn, stream_hash, CollisionSlot::FIRST, tenant_hash).unwrap();
         assert!(tombstones.is_empty());
     }
 
@@ -416,17 +422,18 @@ mod tests {
     fn test_load_stream_tombstones() {
         let conn = setup_test_db();
         let stream_hash = StreamHash::from_raw(12345);
+        let tenant_hash = TenantHash::default_hash();
 
         // Insert a tombstone
         conn.execute(
-            "INSERT INTO tombstones (stream_hash, collision_slot, from_rev, to_rev, deleted_ms)
-             VALUES (?, 0, 1, 10, 1000)",
-            params![stream_hash.as_raw()],
+            "INSERT INTO tombstones (stream_hash, collision_slot, tenant_hash, from_rev, to_rev, deleted_ms)
+             VALUES (?, 0, ?, 1, 10, 1000)",
+            params![stream_hash.as_raw(), tenant_hash.as_raw()],
         )
         .unwrap();
 
         let tombstones =
-            load_stream_tombstones(&conn, stream_hash, CollisionSlot::FIRST).unwrap();
+            load_stream_tombstones(&conn, stream_hash, CollisionSlot::FIRST, tenant_hash).unwrap();
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0].from_rev.as_raw(), 1);
         assert_eq!(tombstones[0].to_rev.as_raw(), 10);
@@ -437,6 +444,7 @@ mod tests {
         let tombstones = vec![StreamTombstone {
             stream_hash: StreamHash::from_raw(1),
             collision_slot: CollisionSlot::FIRST,
+            tenant_hash: TenantHash::default_hash(),
             from_rev: StreamRev::from_raw(5),
             to_rev: StreamRev::from_raw(10),
             deleted_ms: 1000,
@@ -541,6 +549,7 @@ mod tests {
         let tombstone = StreamTombstone {
             stream_hash: StreamHash::from_raw(1),
             collision_slot: CollisionSlot::FIRST,
+            tenant_hash: TenantHash::default_hash(),
             from_rev: StreamRev::from_raw(5),
             to_rev: StreamRev::from_raw(10),
             deleted_ms: 1000,

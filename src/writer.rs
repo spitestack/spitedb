@@ -82,7 +82,7 @@ use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::codec::{compute_checksum, current_time_ms, encode_batch};
+use crate::codec::{compute_checksum, current_time_ms, encode_batch_iter};
 use crate::crypto::{BatchCryptor, CIPHER_AES256GCM, CODEC_ZSTD_L1};
 use crate::error::{Error, Result};
 use crate::types::{
@@ -105,10 +105,15 @@ pub const DEFAULT_BATCH_TIMEOUT_MS: u64 = 10;
 /// Maximum commands per batch.
 ///
 /// If this many commands accumulate before the timeout, execute immediately.
-pub const DEFAULT_BATCH_MAX_SIZE: usize = 1000;
+pub const DEFAULT_BATCH_MAX_SIZE: usize = 20_000;
+
+/// Maximum uncompressed payload bytes per batch (16MB).
+///
+/// If accumulated event payload bytes exceed this before the timeout, execute immediately.
+pub const DEFAULT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Size of the command channel.
-const COMMAND_CHANNEL_SIZE: usize = 4096;
+const COMMAND_CHANNEL_SIZE: usize = 16384;
 
 // =============================================================================
 // Writer Configuration
@@ -122,6 +127,9 @@ pub struct WriterConfig {
 
     /// Maximum commands per batch.
     pub batch_max_size: usize,
+
+    /// Maximum uncompressed payload bytes per batch.
+    pub batch_max_bytes: usize,
 }
 
 impl Default for WriterConfig {
@@ -129,6 +137,7 @@ impl Default for WriterConfig {
         Self {
             batch_timeout: Duration::from_millis(DEFAULT_BATCH_TIMEOUT_MS),
             batch_max_size: DEFAULT_BATCH_MAX_SIZE,
+            batch_max_bytes: DEFAULT_BATCH_MAX_BYTES,
         }
     }
 }
@@ -204,6 +213,56 @@ enum BatchResult {
 }
 
 // =============================================================================
+// Validated Command
+// =============================================================================
+
+/// A command that has passed validation and is ready for execution.
+///
+/// This captures all the computed state needed to execute the command,
+/// including assigned positions and revisions. Stores indices rather than
+/// owned data to avoid cloning.
+struct ValidatedCommand {
+    /// Index into flat_commands array (for accessing original command)
+    flat_index: usize,
+
+    /// Precomputed stream hash
+    stream_hash: StreamHash,
+
+    /// Precomputed tenant hash
+    tenant_hash: TenantHash,
+
+    /// Assigned collision slot
+    collision_slot: CollisionSlot,
+
+    /// First global position assigned to this command's events
+    first_pos: GlobalPos,
+
+    /// Last global position assigned to this command's events
+    last_pos: GlobalPos,
+
+    /// First stream revision assigned to this command's events
+    first_rev: StreamRev,
+
+    /// Last stream revision assigned to this command's events
+    last_rev: StreamRev,
+
+    /// Number of events in this command
+    event_count: usize,
+}
+
+/// Result of validation: either a validated command or a cached/error result.
+enum ValidationResult {
+    /// Command is valid and ready for execution
+    Valid(ValidatedCommand),
+
+    /// Command was a duplicate - return cached result
+    Duplicate(AppendResult),
+
+    /// Command had a conflict error
+    Conflict(Error),
+}
+
+// =============================================================================
 // Staged State
 // =============================================================================
 
@@ -214,11 +273,16 @@ enum BatchResult {
 /// If it rolls back, these are discarded.
 struct StagedState {
     /// Stream heads modified in this batch.
-    /// Key: (stream_hash, collision_slot)
-    heads: HashMap<(StreamHash, CollisionSlot), StreamHeadEntry>,
+    /// Key: (stream_id, tenant_hash) for O(1) lookup with collision safety.
+    /// Using StreamId as key ensures hash collisions don't corrupt staged state.
+    heads: HashMap<(StreamId, TenantHash), StreamHeadEntry>,
 
     /// Next global position to assign.
     next_pos: GlobalPos,
+
+    /// Command cache entries staged in this batch.
+    /// These are only merged into the main cache after COMMIT succeeds.
+    staged_commands: HashMap<String, CommandCacheEntry>,
 }
 
 impl StagedState {
@@ -226,12 +290,14 @@ impl StagedState {
         Self {
             heads: HashMap::new(),
             next_pos,
+            staged_commands: HashMap::new(),
         }
     }
 
     fn clear(&mut self, next_pos: GlobalPos) {
         self.heads.clear();
         self.next_pos = next_pos;
+        self.staged_commands.clear();
     }
 }
 
@@ -340,29 +406,28 @@ impl BatchWriter {
         let now_ms = current_time_ms();
         let cutoff_ms = now_ms.saturating_sub(COMMAND_CACHE_TTL_MS);
 
+        // Query commands directly - no join needed since we store first_rev/last_rev
+        // Order by ASC so newest entries are inserted last (most recently used in LRU)
         let mut stmt = self.conn.prepare(
-            "SELECT c.command_id, c.first_pos, c.last_pos, c.created_ms,
-                    e_first.stream_rev, e_last.stream_rev
-             FROM commands c
-             JOIN event_index e_first ON e_first.global_pos = c.first_pos
-             JOIN event_index e_last ON e_last.global_pos = c.last_pos
-             WHERE c.created_ms >= ?
-             ORDER BY c.created_ms DESC",
+            "SELECT command_id, first_pos, last_pos, first_rev, last_rev, created_ms
+             FROM commands
+             WHERE created_ms >= ?
+             ORDER BY created_ms ASC",
         )?;
 
         let entries = stmt.query_map([cutoff_ms as i64], |row| {
             let command_id: String = row.get(0)?;
             let first_pos: i64 = row.get(1)?;
             let last_pos: i64 = row.get(2)?;
-            let created_ms: i64 = row.get(3)?;
-            let first_rev: i64 = row.get(4)?;
-            let last_rev: i64 = row.get(5)?;
+            let first_rev: i64 = row.get(3)?;
+            let last_rev: i64 = row.get(4)?;
+            let created_ms: i64 = row.get(5)?;
 
-            Ok((command_id, first_pos, last_pos, created_ms, first_rev, last_rev))
+            Ok((command_id, first_pos, last_pos, first_rev, last_rev, created_ms))
         })?;
 
         for entry in entries {
-            let (command_id, first_pos, last_pos, created_ms, first_rev, last_rev) = entry?;
+            let (command_id, first_pos, last_pos, first_rev, last_rev, created_ms) = entry?;
             self.commands.put(
                 command_id,
                 CommandCacheEntry {
@@ -399,62 +464,69 @@ impl BatchWriter {
     // =========================================================================
 
     /// Gets stream head, checking staged first, then committed.
-    fn get_stream_head(&self, stream_id: &StreamId) -> Option<StreamHeadEntry> {
-        let hash = stream_id.hash();
-
-        // Check staged first
-        for entry in self.staged.heads.values() {
-            if &entry.stream_id == stream_id {
-                return Some(entry.clone());
-            }
+    /// Filters by both stream_id and tenant_hash to ensure proper tenant isolation.
+    fn get_stream_head(&self, stream_id: &StreamId, tenant_hash: TenantHash) -> Option<StreamHeadEntry> {
+        // Check staged first - O(1) lookup by (stream_id, tenant_hash)
+        if let Some(entry) = self.staged.heads.get(&(stream_id.clone(), tenant_hash)) {
+            return Some(entry.clone());
         }
 
-        // Fall back to committed
+        // Fall back to committed - must match both stream_id AND tenant_hash
+        let stream_hash = stream_id.hash();
         self.heads_committed
-            .get(&hash)
-            .and_then(|entries| entries.iter().find(|e| &e.stream_id == stream_id))
+            .get(&stream_hash)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| &e.stream_id == stream_id && e.tenant_hash == tenant_hash)
+            })
             .cloned()
     }
 
-    /// Gets current revision for a stream.
-    fn get_current_rev(&self, stream_id: &StreamId) -> StreamRev {
-        self.get_stream_head(stream_id)
+    /// Gets current revision for a stream within a specific tenant.
+    fn get_current_rev(&self, stream_id: &StreamId, tenant_hash: TenantHash) -> StreamRev {
+        self.get_stream_head(stream_id, tenant_hash)
             .map(|h| h.last_rev)
             .unwrap_or(StreamRev::NONE)
     }
 
-    /// Gets or assigns collision slot for a stream.
-    fn get_or_assign_collision_slot(&self, stream_id: &StreamId) -> CollisionSlot {
-        let hash = stream_id.hash();
-
-        // Check if we already have this stream in staged
-        for entry in self.staged.heads.values() {
-            if &entry.stream_id == stream_id {
-                return entry.collision_slot;
-            }
+    /// Gets or assigns collision slot for a stream within a specific tenant.
+    /// Different tenants with the same stream_id get independent collision slots.
+    fn get_or_assign_collision_slot(&self, stream_id: &StreamId, tenant_hash: TenantHash) -> CollisionSlot {
+        // Check if we already have this stream+tenant in staged - O(1) lookup
+        if let Some(entry) = self.staged.heads.get(&(stream_id.clone(), tenant_hash)) {
+            return entry.collision_slot;
         }
 
+        let stream_hash = stream_id.hash();
+
         // Check committed
-        match self.heads_committed.get(&hash) {
+        match self.heads_committed.get(&stream_hash) {
             None => CollisionSlot::FIRST,
             Some(entries) => {
-                if let Some(entry) = entries.iter().find(|e| &e.stream_id == stream_id) {
+                // Look for exact match of stream_id AND tenant
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|e| &e.stream_id == stream_id && e.tenant_hash == tenant_hash)
+                {
                     return entry.collision_slot;
                 }
-                // New stream with collision
+                // New stream with collision - find max slot across ALL tenants for this hash
+                // (collision slots are per-hash, not per-tenant, to avoid DB conflicts)
                 let max_slot = entries
                     .iter()
                     .map(|e| e.collision_slot.as_raw())
                     .max()
                     .unwrap_or(0);
 
-                // Also check staged for this hash
+                // Also check staged for this hash (across all tenants)
+                // Need to iterate staged entries and check their stream_hash
                 let max_staged = self
                     .staged
                     .heads
                     .iter()
-                    .filter(|((h, _), _)| h == &hash)
-                    .map(|((_, s), _)| s.as_raw())
+                    .filter(|((sid, _), _)| sid.hash() == stream_hash)
+                    .map(|(_, entry)| entry.collision_slot.as_raw())
                     .max()
                     .unwrap_or(0);
 
@@ -464,9 +536,21 @@ impl BatchWriter {
     }
 
     /// Looks up cached command result.
+    ///
+    /// Checks staged commands first (for duplicates within current batch),
+    /// then the committed cache. Returns None if not found - the caller should
+    /// proceed with processing. If the command was already processed but evicted
+    /// from cache, the INSERT will fail with a PK constraint error, which is
+    /// expected behavior for retries beyond the cache window.
     fn get_cached_command_result(&mut self, command_id: &CommandId) -> Option<AppendResult> {
         let now_ms = current_time_ms();
 
+        // Check staged commands first (same batch duplicates)
+        if let Some(entry) = self.staged.staged_commands.get(command_id.as_str()) {
+            return Some(entry.to_append_result());
+        }
+
+        // Then check committed cache
         if let Some(entry) = self.commands.get(command_id.as_str()) {
             let age_ms = now_ms.saturating_sub(entry.created_ms);
             if age_ms <= COMMAND_CACHE_TTL_MS {
@@ -475,6 +559,93 @@ impl BatchWriter {
         }
 
         None
+    }
+
+    // =========================================================================
+    // Command Validation
+    // =========================================================================
+
+    /// Validates a command and prepares it for execution.
+    ///
+    /// This performs:
+    /// - Idempotency check (returns cached result if duplicate)
+    /// - Conflict detection (returns error if expected_rev doesn't match)
+    /// - Position and revision assignment
+    /// - Staged state update for intra-batch conflict detection
+    ///
+    /// Returns ValidationResult to distinguish between valid, duplicate, and conflict cases.
+    fn validate_and_prepare_command(
+        &mut self,
+        cmd: &AppendCommand,
+        flat_index: usize,
+        now_ms: u64,
+    ) -> ValidationResult {
+        // Check for duplicate command first
+        if let Some(cached_result) = self.get_cached_command_result(&cmd.command_id) {
+            return ValidationResult::Duplicate(cached_result);
+        }
+
+        // Get tenant hash for tenant-scoped lookups
+        let tenant_hash = cmd.tenant.hash();
+        let stream_hash = cmd.stream_id.hash();
+
+        // Check conflict using staged → committed state (tenant-scoped)
+        let current_rev = self.get_current_rev(&cmd.stream_id, tenant_hash);
+        if cmd.expected_rev != StreamRev::ANY && current_rev != cmd.expected_rev {
+            return ValidationResult::Conflict(Error::Conflict {
+                stream_id: cmd.stream_id.to_string(),
+                expected: cmd.expected_rev.as_raw(),
+                actual: current_rev.as_raw(),
+            });
+        }
+
+        // Get collision slot
+        let collision_slot = self.get_or_assign_collision_slot(&cmd.stream_id, tenant_hash);
+
+        // Assign positions using staged state
+        let event_count = cmd.events.len();
+        let first_pos = self.staged.next_pos;
+        let last_pos = first_pos.add(event_count as u64 - 1);
+        let first_rev = current_rev.next();
+        let last_rev = first_rev.add(event_count as u64 - 1);
+
+        // Update staged state for next command's validation
+        self.staged.next_pos = last_pos.next();
+        self.staged.heads.insert(
+            (cmd.stream_id.clone(), tenant_hash),
+            StreamHeadEntry {
+                stream_id: cmd.stream_id.clone(),
+                tenant_hash,
+                collision_slot,
+                last_rev,
+                last_pos,
+            },
+        );
+
+        // Stage command result for intra-batch idempotency and post-commit cache merge.
+        self.staged.staged_commands.insert(
+            cmd.command_id.to_string(),
+            CommandCacheEntry {
+                first_pos,
+                last_pos,
+                first_rev,
+                last_rev,
+                created_ms: now_ms,
+            },
+        );
+
+        // NOTE: We store flat_index instead of cloning command to avoid ~4MB of cloning per batch
+        ValidationResult::Valid(ValidatedCommand {
+            flat_index,
+            stream_hash,
+            tenant_hash,
+            collision_slot,
+            first_pos,
+            last_pos,
+            first_rev,
+            last_rev,
+            event_count,
+        })
     }
 
     // =========================================================================
@@ -506,14 +677,30 @@ impl BatchWriter {
         for item in items {
             match item {
                 BatchItem::Single(pending) => {
+                    // Check for duplicate in committed cache BEFORE adding to batch.
+                    // This ensures duplicates get their cached result immediately,
+                    // regardless of whether the rest of the batch succeeds or fails.
+                    // (True idempotency: retried commands always return same result)
+                    if let Some(cached) = self.get_cached_command_result(&pending.command.command_id) {
+                        // Send immediately - this command was already committed
+                        let _ = pending.response.send(Ok(cached));
+                        // Don't add to batch - skip this item
+                        continue;
+                    }
                     commands.push(BatchCommand::Single(pending.command));
                     responses.push(BatchResponse::Single(pending.response));
                 }
                 BatchItem::Transaction(pending) => {
+                    // For transactions, process as a unit (duplicates handled in execute_batch_inner)
                     commands.push(BatchCommand::Transaction(pending.commands));
                     responses.push(BatchResponse::Transaction(pending.response));
                 }
             }
+        }
+
+        // All items were duplicates - nothing to process
+        if commands.is_empty() {
+            return;
         }
 
         // Execute the batch and collect results
@@ -560,41 +747,233 @@ impl BatchWriter {
 
     /// Inner batch execution with transaction.
     ///
-    /// Uses raw SQL for transaction management to avoid borrow checker issues
-    /// with the Transaction type holding a mutable borrow of the connection.
+    /// NEW ARCHITECTURE: Single blob per batch
+    /// 1. Pre-validate all commands (conflicts, idempotency)
+    /// 2. Collect all events from valid commands into Vec<EventData>
+    /// 3. Encode ALL events into ONE compressed blob
+    /// 4. Single INSERT into batches table
+    /// 5. For each valid command: INSERT event_index entries, UPSERT stream_heads
+    /// 6. INSERT into commands table (durable idempotency)
     fn execute_batch_inner(&mut self, commands: &[BatchCommand]) -> Result<Vec<BatchResult>> {
-        // Begin outer transaction using raw SQL
-        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        // =====================================================================
+        // Phase 1: Validate all commands, collect events from valid ones
+        // =====================================================================
 
-        let mut savepoint_counter = 0;
-        let mut results = Vec::with_capacity(commands.len());
+        let now_ms = current_time_ms();
 
-        for cmd in commands {
+        // Flatten commands for validation
+        let mut flat_commands: Vec<(&AppendCommand, usize, Option<usize>)> = Vec::new();
+        for (batch_idx, cmd) in commands.iter().enumerate() {
             match cmd {
                 BatchCommand::Single(command) => {
-                    let result = self.execute_command_in_savepoint(
-                        command,
-                        &mut savepoint_counter,
-                    );
-                    results.push(BatchResult::Single(result));
+                    flat_commands.push((command, batch_idx, None));
                 }
-                BatchCommand::Transaction(commands) => {
-                    let mut tx_results = Vec::with_capacity(commands.len());
-                    for command in commands {
-                        let result = self.execute_command_in_savepoint(
-                            command,
-                            &mut savepoint_counter,
-                        );
-                        tx_results.push(result);
+                BatchCommand::Transaction(cmds) => {
+                    for (tx_idx, command) in cmds.iter().enumerate() {
+                        flat_commands.push((command, batch_idx, Some(tx_idx)));
                     }
-                    results.push(BatchResult::Transaction(tx_results));
                 }
             }
         }
 
-        // Commit the outer transaction
-        match self.conn.execute("COMMIT", []) {
-            Ok(_) => Ok(results),
+        // Validate each command (no event collection - we'll iterate later)
+        let mut valid_commands: Vec<ValidatedCommand> = Vec::new();
+
+        // Pre-allocate result slots
+        let mut results: Vec<BatchResult> = commands
+            .iter()
+            .map(|cmd| match cmd {
+                BatchCommand::Single(_) => BatchResult::Single(Err(Error::Schema("not processed".to_string()))),
+                BatchCommand::Transaction(cmds) => {
+                    BatchResult::Transaction(
+                        (0..cmds.len())
+                            .map(|_| Err(Error::Schema("not processed".to_string())))
+                            .collect()
+                    )
+                }
+            })
+            .collect();
+
+        for (idx, (cmd, batch_idx, tx_idx)) in flat_commands.iter().enumerate() {
+            match self.validate_and_prepare_command(cmd, idx, now_ms) {
+                ValidationResult::Valid(validated) => {
+                    valid_commands.push(validated);
+                }
+                ValidationResult::Duplicate(cached_result) => {
+                    // Return cached result
+                    match tx_idx {
+                        None => results[*batch_idx] = BatchResult::Single(Ok(cached_result)),
+                        Some(ti) => {
+                            if let BatchResult::Transaction(ref mut tx_results) = results[*batch_idx] {
+                                tx_results[*ti] = Ok(cached_result);
+                            }
+                        }
+                    }
+                }
+                ValidationResult::Conflict(err) => {
+                    // Return conflict error
+                    match tx_idx {
+                        None => results[*batch_idx] = BatchResult::Single(Err(err)),
+                        Some(ti) => {
+                            if let BatchResult::Transaction(ref mut tx_results) = results[*batch_idx] {
+                                tx_results[*ti] = Err(err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no valid commands, return early with results (duplicates/conflicts only)
+        if valid_commands.is_empty() {
+            return Ok(results);
+        }
+
+        // Calculate total events from valid commands
+        let total_events: usize = valid_commands.iter().map(|v| v.event_count).sum();
+
+        // =====================================================================
+        // Phase 2: Encode ALL events into ONE blob (zero-copy via iterator)
+        // =====================================================================
+        let base_pos = valid_commands.first().unwrap().first_pos.as_raw() as i64;
+
+        // Build iterator over all event data from valid commands (no cloning)
+        let event_iter = valid_commands.iter()
+            .flat_map(|v| flat_commands[v.flat_index].0.events.iter().map(|e| e.data.as_slice()));
+
+        let (batch_data, nonce, event_offsets) = encode_batch_iter(event_iter, base_pos, &self.cryptor)?;
+        let checksum = compute_checksum(&batch_data);
+
+        // =====================================================================
+        // Phase 3: Database operations
+        // =====================================================================
+
+        // Begin transaction
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+
+        // Single INSERT into batches table
+        self.conn.prepare_cached(
+            "INSERT INTO batches (base_pos, event_count, created_ms, codec, cipher, nonce, checksum, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )?.execute(params![
+            base_pos,
+            total_events as i64,
+            now_ms as i64,
+            CODEC_ZSTD_L1,
+            CIPHER_AES256GCM,
+            nonce.as_slice(),
+            checksum.as_slice(),
+            batch_data.as_slice(),
+        ])?;
+
+        let batch_id = self.conn.last_insert_rowid();
+
+        // Prepare cached statements for event_index, stream_heads, and commands.
+        // Using cached prepared statements is faster than dynamic bulk INSERT because:
+        // - Statement is compiled once and reused for every execution
+        // - SQLite WAL mode batches all writes to a single fsync at COMMIT anyway
+        // - No query parsing overhead per batch (dynamic SQL defeats prepare_cached)
+        let mut event_idx_stmt = self.conn.prepare_cached(
+            "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, tenant_hash, collision_slot, stream_rev)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )?;
+
+        let mut stream_head_stmt = self.conn.prepare_cached(
+            "INSERT INTO stream_heads (stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(stream_id, tenant_hash) DO UPDATE SET
+                 last_rev = excluded.last_rev,
+                 last_pos = excluded.last_pos"
+        )?;
+
+        let mut cmd_stmt = self.conn.prepare_cached(
+            "INSERT INTO commands (command_id, stream_hash, first_pos, last_pos, first_rev, last_rev, created_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )?;
+
+        // Track offset into the combined event_offsets array
+        let mut global_offset_idx = 0usize;
+
+        // Process each valid command
+        for validated in &valid_commands {
+            let mut pos = validated.first_pos;
+            let mut rev = validated.first_rev;
+
+            // Insert event_index entries for this command's events
+            for _ in 0..validated.event_count {
+                let (byte_offset, byte_len) = event_offsets[global_offset_idx];
+                event_idx_stmt.execute(params![
+                    pos.as_raw() as i64,
+                    batch_id,
+                    byte_offset as i64,
+                    byte_len as i64,
+                    validated.stream_hash.as_raw(),
+                    validated.tenant_hash.as_raw(),
+                    validated.collision_slot.as_raw() as i64,
+                    rev.as_raw() as i64,
+                ])?;
+                pos = pos.next();
+                rev = rev.next();
+                global_offset_idx += 1;
+            }
+
+            // Get command reference for stream_id and command_id
+            let cmd = flat_commands[validated.flat_index].0;
+
+            // UPSERT stream head
+            stream_head_stmt.execute(params![
+                cmd.stream_id.as_str(),
+                validated.stream_hash.as_raw(),
+                validated.tenant_hash.as_raw(),
+                validated.collision_slot.as_raw() as i64,
+                validated.last_rev.as_raw() as i64,
+                validated.last_pos.as_raw() as i64,
+            ])?;
+
+            // INSERT command record (for idempotency)
+            cmd_stmt.execute(params![
+                cmd.command_id.as_str(),
+                validated.stream_hash.as_raw(),
+                validated.first_pos.as_raw() as i64,
+                validated.last_pos.as_raw() as i64,
+                validated.first_rev.as_raw() as i64,
+                validated.last_rev.as_raw() as i64,
+                now_ms as i64,
+            ])?;
+        }
+
+        // Drop prepared statements before commit
+        drop(event_idx_stmt);
+        drop(stream_head_stmt);
+        drop(cmd_stmt);
+
+        // Commit
+        let commit_result = self.conn.execute("COMMIT", []);
+
+        match commit_result {
+            Ok(_) => {
+                // Fill in successful results for valid commands
+                for validated in valid_commands {
+                    let result = AppendResult::new(
+                        validated.first_pos,
+                        validated.last_pos,
+                        validated.first_rev,
+                        validated.last_rev,
+                    );
+
+                    // Find the original position in flat_commands
+                    let (_, batch_idx, tx_idx) = flat_commands[validated.flat_index];
+                    match tx_idx {
+                        None => results[batch_idx] = BatchResult::Single(Ok(result)),
+                        Some(ti) => {
+                            if let BatchResult::Transaction(ref mut tx_results) = results[batch_idx] {
+                                tx_results[ti] = Ok(result);
+                            }
+                        }
+                    }
+                }
+                Ok(results)
+            }
             Err(e) => {
                 // Try to rollback on commit failure
                 let _ = self.conn.execute("ROLLBACK", []);
@@ -603,183 +982,20 @@ impl BatchWriter {
         }
     }
 
-    /// Executes a single command within a SAVEPOINT.
-    fn execute_command_in_savepoint(
-        &mut self,
-        cmd: &AppendCommand,
-        savepoint_counter: &mut usize,
-    ) -> Result<AppendResult> {
-        // Check for duplicate command first (before SAVEPOINT)
-        if let Some(cached_result) = self.get_cached_command_result(&cmd.command_id) {
-            return Ok(cached_result);
-        }
-
-        // Check conflict using staged → committed state
-        let current_rev = self.get_current_rev(&cmd.stream_id);
-        if cmd.expected_rev != StreamRev::ANY && current_rev != cmd.expected_rev {
-            return Err(Error::Conflict {
-                stream_id: cmd.stream_id.to_string(),
-                expected: cmd.expected_rev.as_raw(),
-                actual: current_rev.as_raw(),
-            });
-        }
-
-        // Create SAVEPOINT
-        let sp_name = format!("cmd_{}", *savepoint_counter);
-        *savepoint_counter += 1;
-
-        self.conn.execute(&format!("SAVEPOINT {}", sp_name), [])?;
-
-        // Try to execute the command
-        match self.execute_command_inner(cmd) {
-            Ok(result) => {
-                // Release SAVEPOINT (keep changes)
-                self.conn.execute(&format!("RELEASE {}", sp_name), [])?;
-                Ok(result)
-            }
-            Err(e) => {
-                // Rollback SAVEPOINT (discard changes)
-                self.conn.execute(&format!("ROLLBACK TO {}", sp_name), [])?;
-                self.conn.execute(&format!("RELEASE {}", sp_name), [])?;
-                Err(e)
-            }
-        }
-    }
-
-    /// Executes a command's database operations.
-    fn execute_command_inner(&mut self, cmd: &AppendCommand) -> Result<AppendResult> {
-        let collision_slot = self.get_or_assign_collision_slot(&cmd.stream_id);
-        let stream_hash = cmd.stream_id.hash();
-        let tenant_hash = cmd.tenant.hash();
-
-        // Calculate positions using staged state
-        let first_pos = self.staged.next_pos;
-        let event_count = cmd.events.len() as u64;
-        let last_pos = first_pos.add(event_count - 1);
-
-        let current_rev = self.get_current_rev(&cmd.stream_id);
-        let first_rev = current_rev.next();
-        let last_rev = first_rev.add(event_count - 1);
-
-        let now_ms = current_time_ms();
-
-        // Encode events (compress and encrypt)
-        let batch_id = first_pos.as_raw() as i64;
-        let (batch_data, nonce, event_offsets) = encode_batch(&cmd.events, batch_id, &self.cryptor)?;
-        let checksum = compute_checksum(&batch_data);
-
-        // Insert batch
-        self.conn.execute(
-            "INSERT INTO batches (base_pos, event_count, created_ms, codec, cipher, nonce, checksum, data)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                first_pos.as_raw() as i64,
-                event_count as i64,
-                now_ms as i64,
-                CODEC_ZSTD_L1,
-                CIPHER_AES256GCM,
-                nonce.as_slice(),
-                checksum.as_slice(),
-                batch_data.as_slice(),
-            ],
-        )?;
-
-        let batch_id = self.conn.last_insert_rowid();
-
-        // Insert event index entries
-        let mut rev = first_rev;
-        let mut pos = first_pos;
-        for (offset, len) in event_offsets.iter() {
-            self.conn.execute(
-                "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, tenant_hash, collision_slot, stream_rev)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    pos.as_raw() as i64,
-                    batch_id,
-                    *offset as i64,
-                    *len as i64,
-                    stream_hash.as_raw(),
-                    tenant_hash.as_raw(),
-                    collision_slot.as_raw() as i64,
-                    rev.as_raw() as i64,
-                ],
-            )?;
-
-            pos = pos.next();
-            rev = rev.next();
-        }
-
-        // Upsert stream head
-        self.conn.execute(
-            "INSERT INTO stream_heads (stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(stream_id, tenant_hash) DO UPDATE SET
-                 last_rev = excluded.last_rev,
-                 last_pos = excluded.last_pos",
-            params![
-                cmd.stream_id.as_str(),
-                stream_hash.as_raw(),
-                tenant_hash.as_raw(),
-                collision_slot.as_raw() as i64,
-                last_rev.as_raw() as i64,
-                last_pos.as_raw() as i64,
-            ],
-        )?;
-
-        // Record command
-        self.conn.execute(
-            "INSERT INTO commands (command_id, stream_hash, first_pos, last_pos, created_ms)
-             VALUES (?, ?, ?, ?, ?)",
-            params![
-                cmd.command_id.as_str(),
-                stream_hash.as_raw(),
-                first_pos.as_raw() as i64,
-                last_pos.as_raw() as i64,
-                now_ms as i64,
-            ],
-        )?;
-
-        // Update staged state
-        self.staged.next_pos = last_pos.next();
-        self.staged.heads.insert(
-            (stream_hash, collision_slot),
-            StreamHeadEntry {
-                stream_id: cmd.stream_id.clone(),
-                tenant_hash,
-                collision_slot,
-                last_rev,
-                last_pos,
-            },
-        );
-
-        // Cache command result (will be available for duplicates)
-        self.commands.put(
-            cmd.command_id.to_string(),
-            CommandCacheEntry {
-                first_pos,
-                last_pos,
-                first_rev,
-                last_rev,
-                created_ms: now_ms,
-            },
-        );
-
-        Ok(AppendResult::new(first_pos, last_pos, first_rev, last_rev))
-    }
-
     /// Commits staged state to committed state.
     ///
     /// This:
     /// 1. Updates committed position counter
     /// 2. Merges staged stream heads into committed state
-    /// 3. Broadcasts all staged events to subscribers
+    /// 3. Merges staged command cache entries into the main cache
     fn commit_staged_state(&mut self) {
         // Update committed position
         self.next_pos_committed = self.staged.next_pos;
 
         // Merge staged heads into committed
-        for ((hash, _slot), entry) in self.staged.heads.drain() {
-            let entries = self.heads_committed.entry(hash).or_insert_with(Vec::new);
+        for ((stream_id, _tenant_hash), entry) in self.staged.heads.drain() {
+            let stream_hash = stream_id.hash();
+            let entries = self.heads_committed.entry(stream_hash).or_insert_with(Vec::new);
 
             // Update or add
             if let Some(existing) = entries.iter_mut().find(|e| e.stream_id == entry.stream_id) {
@@ -788,6 +1004,11 @@ impl BatchWriter {
             } else {
                 entries.push(entry);
             }
+        }
+
+        // Merge staged command cache entries into main cache
+        for (command_id, entry) in self.staged.staged_commands.drain() {
+            self.commands.put(command_id, entry);
         }
     }
 
@@ -801,18 +1022,26 @@ impl BatchWriter {
     /// 1. They're infrequent compared to appends
     /// 2. Users expect immediate effect
     /// 3. They don't need group commit optimization
+    ///
+    /// Implements idempotency via the `command_id` - retries return the cached result.
     pub fn execute_delete_stream(&mut self, cmd: DeleteStreamCommand) -> Result<DeleteStreamResult> {
         let stream_hash = cmd.stream_id.hash();
+        let tenant_hash = cmd.tenant.hash();
+
+        // Check for duplicate delete command first (idempotency)
+        if let Some(cached_result) = self.get_cached_delete_command_result(&cmd.command_id, &cmd.stream_id)? {
+            return Ok(cached_result);
+        }
 
         // Get stream head to determine collision slot and current revision
-        let head = self.get_stream_head(&cmd.stream_id);
+        let head = self.get_stream_head(&cmd.stream_id, tenant_hash);
 
         let collision_slot = match &head {
             Some(h) => h.collision_slot,
             None => {
-                // Stream doesn't exist - nothing to delete
+                // Stream doesn't exist for this tenant - nothing to delete
                 return Err(Error::Schema(format!(
-                    "stream '{}' does not exist",
+                    "stream '{}' does not exist for tenant",
                     cmd.stream_id
                 )));
             }
@@ -843,14 +1072,29 @@ impl BatchWriter {
 
         let now_ms = current_time_ms();
 
-        // Insert tombstone record
+        // Insert tombstone record with tenant scope
         // Use INSERT to create the tombstone (we allow overlapping tombstones)
         self.conn.execute(
-            "INSERT INTO tombstones (stream_hash, collision_slot, from_rev, to_rev, deleted_ms)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO tombstones (stream_hash, collision_slot, tenant_hash, from_rev, to_rev, deleted_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 stream_hash.as_raw(),
                 collision_slot.as_raw() as i64,
+                tenant_hash.as_raw(),
+                from_rev.as_raw() as i64,
+                to_rev.as_raw() as i64,
+                now_ms as i64,
+            ],
+        )?;
+
+        // Record delete command for idempotency
+        self.conn.execute(
+            "INSERT INTO delete_commands (command_id, stream_hash, tenant_hash, from_rev, to_rev, deleted_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                cmd.command_id.as_str(),
+                stream_hash.as_raw(),
+                tenant_hash.as_raw(),
                 from_rev.as_raw() as i64,
                 to_rev.as_raw() as i64,
                 now_ms as i64,
@@ -863,6 +1107,35 @@ impl BatchWriter {
             to_rev,
             deleted_ms: now_ms,
         })
+    }
+
+    /// Looks up cached delete command result from the database.
+    fn get_cached_delete_command_result(
+        &self,
+        command_id: &CommandId,
+        stream_id: &StreamId,
+    ) -> Result<Option<DeleteStreamResult>> {
+        let result = self.conn.query_row(
+            "SELECT from_rev, to_rev, deleted_ms FROM delete_commands WHERE command_id = ?",
+            params![command_id.as_str()],
+            |row| {
+                let from_rev: i64 = row.get(0)?;
+                let to_rev: i64 = row.get(1)?;
+                let deleted_ms: i64 = row.get(2)?;
+                Ok((from_rev, to_rev, deleted_ms))
+            },
+        );
+
+        match result {
+            Ok((from_rev, to_rev, deleted_ms)) => Ok(Some(DeleteStreamResult {
+                stream_id: stream_id.clone(),
+                from_rev: StreamRev::from_raw(from_rev as u64),
+                to_rev: StreamRev::from_raw(to_rev as u64),
+                deleted_ms: deleted_ms as u64,
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Executes a tenant delete command (creates tenant tombstone).
@@ -1049,10 +1322,18 @@ impl TransactionBuilder {
 // Writer Loop
 // =============================================================================
 
+/// Calculates the total payload bytes for an AppendCommand.
+fn command_payload_bytes(cmd: &AppendCommand) -> usize {
+    cmd.events.iter().map(|e| e.data.len()).sum()
+}
+
 /// Runs the batch writer loop.
 ///
 /// This function runs on a dedicated thread, collecting commands and
-/// executing them in batches.
+/// executing them in batches. Batches are flushed when any threshold is met:
+/// - Time: batch_timeout elapsed
+/// - Count: batch_max_size commands accumulated
+/// - Bytes: batch_max_bytes uncompressed payload bytes accumulated
 pub async fn run_batch_writer(
     mut writer: BatchWriter,
     mut rx: mpsc::Receiver<WriteRequest>,
@@ -1060,6 +1341,7 @@ pub async fn run_batch_writer(
 ) {
     let mut batch: Vec<BatchItem> = Vec::new();
     let mut batch_start: Option<Instant> = None;
+    let mut batch_bytes: usize = 0;
 
     loop {
         // Calculate timeout for batch
@@ -1081,12 +1363,16 @@ pub async fn run_batch_writer(
                     batch_start = Some(Instant::now());
                 }
 
+                // Track payload bytes
+                batch_bytes += command_payload_bytes(&command);
+
                 batch.push(BatchItem::Single(PendingCommand { command, response }));
 
-                // Check if batch is full
-                if batch.len() >= config.batch_max_size {
+                // Check if batch is full (count or bytes threshold)
+                if batch.len() >= config.batch_max_size || batch_bytes >= config.batch_max_bytes {
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
+                    batch_bytes = 0;
                 }
             }
             Ok(Some(WriteRequest::Transaction { commands, response })) => {
@@ -1094,15 +1380,21 @@ pub async fn run_batch_writer(
                     batch_start = Some(Instant::now());
                 }
 
+                // Track payload bytes for all commands in transaction
+                for cmd in &commands {
+                    batch_bytes += command_payload_bytes(cmd);
+                }
+
                 batch.push(BatchItem::Transaction(PendingTransaction {
                     commands,
                     response,
                 }));
 
-                // Check if batch is full
-                if batch.len() >= config.batch_max_size {
+                // Check if batch is full (count or bytes threshold)
+                if batch.len() >= config.batch_max_size || batch_bytes >= config.batch_max_bytes {
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
+                    batch_bytes = 0;
                 }
             }
             Ok(Some(WriteRequest::DeleteStream { command, response })) => {
@@ -1135,6 +1427,7 @@ pub async fn run_batch_writer(
                 if !batch.is_empty() {
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
+                    batch_bytes = 0;
                 }
             }
         }
@@ -1433,6 +1726,7 @@ mod tests {
         let config = WriterConfig {
             batch_timeout: Duration::from_millis(100),
             batch_max_size: 100,
+            batch_max_bytes: DEFAULT_BATCH_MAX_BYTES,
         };
         let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), config).unwrap();
 

@@ -49,14 +49,39 @@ pub fn encode_batch(
     batch_id: i64,
     cryptor: &BatchCryptor,
 ) -> Result<(Vec<u8>, [u8; AES_GCM_NONCE_SIZE], Vec<(usize, usize)>)> {
+    encode_batch_iter(events.iter().map(|e| e.data.as_slice()), batch_id, cryptor)
+}
+
+/// Encodes event data from an iterator into a compressed and encrypted batch blob.
+///
+/// This is the zero-copy version that accepts an iterator of byte slices,
+/// avoiding the need to collect events into a Vec.
+///
+/// # Returns
+///
+/// A tuple of:
+/// - The encrypted blob data
+/// - The nonce used for encryption (must be stored with the batch)
+/// - A vec of (byte_offset, byte_len) for each event in the uncompressed batch
+///
+/// # Arguments
+///
+/// * `event_data` - Iterator yielding event data as byte slices
+/// * `batch_id` - Unique batch identifier (for key derivation)
+/// * `cryptor` - The cryptor for compression and encryption
+pub fn encode_batch_iter<'a>(
+    event_data: impl Iterator<Item = &'a [u8]>,
+    batch_id: i64,
+    cryptor: &BatchCryptor,
+) -> Result<(Vec<u8>, [u8; AES_GCM_NONCE_SIZE], Vec<(usize, usize)>)> {
     // Concatenate raw payloads
     let mut data = Vec::new();
     let mut offsets = Vec::new();
 
-    for event in events {
+    for bytes in event_data {
         let start_offset = data.len();
-        data.extend_from_slice(&event.data);
-        let len = event.data.len();
+        data.extend_from_slice(bytes);
+        let len = bytes.len();
         offsets.push((start_offset, len));
     }
 

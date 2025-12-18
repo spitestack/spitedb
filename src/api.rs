@@ -442,8 +442,9 @@ impl SpiteDB {
         &self,
         command_id: impl Into<CommandId>,
         stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
     ) -> Result<DeleteStreamResult> {
-        let command = DeleteStreamCommand::delete_all(command_id, stream_id);
+        let command = DeleteStreamCommand::delete_all(command_id, stream_id, tenant);
         self.writer.delete_stream(command).await
     }
 
@@ -458,6 +459,7 @@ impl SpiteDB {
     ///
     /// * `command_id` - Unique ID for idempotency (safe to retry)
     /// * `stream_id` - The stream to delete from
+    /// * `tenant` - The tenant that owns this stream
     /// * `from_rev` - First revision to delete (inclusive)
     /// * `to_rev` - Last revision to delete (inclusive)
     ///
@@ -473,10 +475,11 @@ impl SpiteDB {
         &self,
         command_id: impl Into<CommandId>,
         stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
         from_rev: StreamRev,
         to_rev: StreamRev,
     ) -> Result<DeleteStreamResult> {
-        let command = DeleteStreamCommand::delete_range(command_id, stream_id, from_rev, to_rev);
+        let command = DeleteStreamCommand::delete_range(command_id, stream_id, tenant, from_rev, to_rev);
         self.writer.delete_stream(command).await
     }
 
@@ -810,7 +813,7 @@ mod tests {
         assert_eq!(events.len(), 2);
 
         // Delete the stream
-        let result = db.delete_stream("delete-cmd-1", "user-123").await.unwrap();
+        let result = db.delete_stream("delete-cmd-1", "user-123", "default").await.unwrap();
         assert_eq!(result.stream_id.as_str(), "user-123");
 
         // Verify events are filtered out
@@ -858,6 +861,7 @@ mod tests {
             .delete_stream_range(
                 "delete-cmd-2",
                 "user-456",
+                "default",
                 StreamRev::from_raw(2),
                 StreamRev::from_raw(3),
             )
@@ -883,7 +887,7 @@ mod tests {
         let (db, _temp_dir) = test_db().await;
 
         // Try to delete a non-existent stream
-        let result = db.delete_stream("delete-cmd", "nonexistent").await;
+        let result = db.delete_stream("delete-cmd", "nonexistent", "default").await;
         assert!(result.is_err());
 
         db.shutdown().await;
