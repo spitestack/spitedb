@@ -6,8 +6,8 @@
  */
 
 import type { SpiteDbNapi } from "@spitestack/db";
-import { TodoAggregate } from "../../../domain/aggregates/Todo/aggregate";
-import type { TodoEvent } from "../../../domain/aggregates/Todo/events";
+import { TodoAggregate } from "../../../src/domain/aggregates/Todo/aggregate";
+import type { TodoEvent } from "../../../src/domain/aggregates/Todo/events";
 import {
   validateTodoCreate, validateTodoComplete, validateTodoRename,
   type ValidationError as ValidationErrorType,
@@ -33,6 +33,7 @@ export interface TodoCommandContext {
   db: SpiteDbNapi;
   commandId: string;
   tenant: string;
+  actorId?: string;
 }
 
 export interface TodoCreateInput {
@@ -52,6 +53,31 @@ export interface TodoRenameInput {
 /**
  * Load aggregate, execute command, extract events, persist to SpiteDB
  */
+type EventEnvelope<T> = {
+  data: T;
+  __meta: {
+    tenantId: string;
+    actorId?: string | null;
+  };
+};
+
+function unwrapEvent<T>(event: T | EventEnvelope<T>): T {
+  if (event && typeof event === "object" && "data" in event && "__meta" in event) {
+    return (event as EventEnvelope<T>).data;
+  }
+  return event as T;
+}
+
+function wrapEvent<T>(event: T, tenantId: string, actorId?: string): EventEnvelope<T> {
+  return {
+    data: event,
+    __meta: {
+      tenantId,
+      actorId: actorId ?? null,
+    },
+  };
+}
+
 async function executeCommand<TInput extends { id: string }>(
   ctx: TodoCommandContext,
   input: TInput,
@@ -64,8 +90,8 @@ async function executeCommand<TInput extends { id: string }>(
   const aggregate = new TodoAggregate();
 
   for (const event of existingEvents) {
-    const parsed = JSON.parse(event.data.toString()) as TodoEvent;
-    aggregate.apply(parsed);
+    const parsed = JSON.parse(event.data.toString()) as TodoEvent | EventEnvelope<TodoEvent>;
+    aggregate.apply(unwrapEvent(parsed));
   }
 
   // Execute the command (populates aggregate.events)
@@ -85,7 +111,9 @@ async function executeCommand<TInput extends { id: string }>(
   // Persist to SpiteDB
   // expectedRev: 0 means stream must not exist, -1 means any revision
   const expectedRev = existingEvents.length === 0 ? 0 : existingEvents.length;
-  const eventBuffers = newEvents.map((e) => Buffer.from(JSON.stringify(e)));
+  const eventBuffers = newEvents.map((e) =>
+    Buffer.from(JSON.stringify(wrapEvent(e, ctx.tenant, ctx.actorId)))
+  );
 
   const result = await ctx.db.append(
     input.id,

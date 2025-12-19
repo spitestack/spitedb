@@ -150,7 +150,7 @@ pub use api::SpiteDB;
 pub use error::{Error, Result};
 pub use schema::Database;
 pub use writer::{
-    BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer,
+    AtomicTransactionBuilder, BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer,
     // Admission control types
     AdmissionConfig, AdmissionController, AdmissionMetrics, MetricsSnapshot, LatencyTracker,
 };
@@ -158,7 +158,7 @@ pub use writer::{
 // Re-export commonly used types from the types module
 pub use types::{
     AppendCommand, AppendResult, CollisionSlot, CommandId, Event, EventData, GlobalPos,
-    StreamHash, StreamId, StreamRev, Tenant, TenantHash,
+    SqlStatement, SqlValue, StreamHash, StreamId, StreamRev, Tenant, TenantHash,
     // Tombstone types
     DeleteStreamCommand, DeleteStreamResult, DeleteTenantCommand, DeleteTenantResult,
     StreamTombstone, TenantTombstone,

@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use spitedb::{
     AppendCommand, AppendResult, CommandId, Event, EventData, GlobalPos, MetricsSnapshot, SpiteDB,
-    StreamId, StreamRev, Tenant,
+    SqlStatement, SqlValue, StreamId, StreamRev, Tenant,
 };
 
 mod projection;
@@ -101,6 +101,43 @@ impl SpiteDBNapi {
             .map_err(|e| Error::from_reason(format!("Append failed: {}", e)))?;
 
         Ok(AppendResultNapi::from(result))
+    }
+
+    /// Executes an atomic transaction of appends with optional SQL statements.
+    ///
+    /// All commands must succeed; any conflict or duplicate aborts the transaction.
+    #[napi(js_name = "atomicTransaction")]
+    pub async fn atomic_transaction(
+        &self,
+        commands: Vec<AppendCommandNapi>,
+        sql_ops: Vec<SqlStatementNapi>,
+    ) -> Result<Vec<AppendResultNapi>> {
+        if commands.is_empty() && sql_ops.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.inner.begin_atomic_transaction();
+
+        for cmd in commands {
+            let append = build_append_command(cmd)?;
+            tx.append(append);
+        }
+
+        for stmt in sql_ops {
+            let params = stmt
+                .params
+                .into_iter()
+                .map(parse_sql_param)
+                .collect::<Result<Vec<_>>>()?;
+            tx.push_sql(SqlStatement::new(stmt.sql, params));
+        }
+
+        let results = tx
+            .submit()
+            .await
+            .map_err(|e| Error::from_reason(format!("Atomic transaction failed: {}", e)))?;
+
+        Ok(results.into_iter().map(AppendResultNapi::from).collect())
     }
 
     /// Reads events from a stream.
@@ -319,6 +356,41 @@ pub struct AppendResultNapi {
     pub last_rev: i64,
 }
 
+/// Append command payload for atomic transactions.
+#[napi(object)]
+pub struct AppendCommandNapi {
+    /// The stream to append to
+    pub stream_id: String,
+    /// Unique command ID for idempotency
+    pub command_id: String,
+    /// Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision
+    pub expected_rev: i64,
+    /// Array of event data buffers
+    pub events: Vec<Buffer>,
+    /// Tenant ID (use DEFAULT_TENANT for single-tenant apps)
+    pub tenant: String,
+}
+
+/// SQL parameter for atomic transactions.
+#[napi(object)]
+pub struct SqlParamNapi {
+    /// Parameter type: "null", "integer", "real", "text", "blob", "bool"
+    pub kind: String,
+    /// String value (used for integer/real/text/bool)
+    pub value: Option<String>,
+    /// Blob value (used for blob)
+    pub blob: Option<Buffer>,
+}
+
+/// SQL statement for atomic transactions.
+#[napi(object)]
+pub struct SqlStatementNapi {
+    /// SQL statement with ? placeholders
+    pub sql: String,
+    /// Parameters for the statement
+    pub params: Vec<SqlParamNapi>,
+}
+
 impl From<AppendResult> for AppendResultNapi {
     fn from(result: AppendResult) -> Self {
         Self {
@@ -337,6 +409,8 @@ pub struct EventNapi {
     pub global_pos: i64,
     /// Stream this event belongs to
     pub stream_id: String,
+    /// Tenant hash for this event
+    pub tenant_hash: i64,
     /// Revision within the stream
     pub stream_rev: i64,
     /// Timestamp when stored (Unix milliseconds)
@@ -350,6 +424,7 @@ impl From<Event> for EventNapi {
         Self {
             global_pos: event.global_pos.as_raw() as i64,
             stream_id: event.stream_id.to_string(),
+            tenant_hash: event.tenant_hash.as_raw(),
             stream_rev: event.stream_rev.as_raw() as i64,
             timestamp_ms: event.timestamp_ms as i64,
             data: Buffer::from(event.data),
@@ -437,5 +512,88 @@ impl From<MetricsSnapshot> for AdmissionMetricsNapi {
             rejection_rate: m.rejection_rate,
             adjustments: m.adjustments as i64,
         }
+    }
+}
+
+fn build_append_command(cmd: AppendCommandNapi) -> Result<AppendCommand> {
+    if cmd.events.is_empty() {
+        return Err(Error::from_reason("events array cannot be empty"));
+    }
+
+    let expected = if cmd.expected_rev < 0 {
+        StreamRev::ANY
+    } else {
+        StreamRev::from_raw(cmd.expected_rev as u64)
+    };
+
+    let event_data: Vec<EventData> = cmd
+        .events
+        .into_iter()
+        .map(|buf| EventData::new(buf.to_vec()))
+        .collect();
+
+    let tenant_obj = Tenant::new(cmd.tenant);
+
+    Ok(AppendCommand::new_with_tenant(
+        CommandId::new(cmd.command_id),
+        StreamId::new(cmd.stream_id),
+        tenant_obj,
+        expected,
+        event_data,
+    ))
+}
+
+fn parse_sql_param(param: SqlParamNapi) -> Result<SqlValue> {
+    match param.kind.to_lowercase().as_str() {
+        "null" => Ok(SqlValue::Null),
+        "integer" => {
+            let value = param
+                .value
+                .ok_or_else(|| Error::from_reason("integer param missing value"))?;
+            let parsed = value
+                .parse::<i64>()
+                .map_err(|_| Error::from_reason("integer param must be i64"))?;
+            Ok(SqlValue::Integer(parsed))
+        }
+        "real" => {
+            let value = param
+                .value
+                .ok_or_else(|| Error::from_reason("real param missing value"))?;
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|_| Error::from_reason("real param must be f64"))?;
+            Ok(SqlValue::Real(parsed))
+        }
+        "text" => {
+            let value = param
+                .value
+                .ok_or_else(|| Error::from_reason("text param missing value"))?;
+            Ok(SqlValue::Text(value))
+        }
+        "bool" => {
+            let value = param
+                .value
+                .ok_or_else(|| Error::from_reason("bool param missing value"))?;
+            let parsed = match value.as_str() {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => {
+                    return Err(Error::from_reason(
+                        "bool param must be true/false/1/0",
+                    ))
+                }
+            };
+            Ok(SqlValue::Bool(parsed))
+        }
+        "blob" => {
+            let value = param
+                .blob
+                .ok_or_else(|| Error::from_reason("blob param missing value"))?;
+            Ok(SqlValue::Blob(value.to_vec()))
+        }
+        other => Err(Error::from_reason(format!(
+            "unsupported SQL param kind: {}",
+            other
+        ))),
     }
 }

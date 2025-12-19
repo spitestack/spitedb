@@ -11,3 +11,9 @@ export { todoHandlers, type TodoCommand } from "./handlers/todo.handler";
 
 // Validators
 export { validateTodoCreate, validateTodoComplete, validateTodoRename } from "./validators/todo.validator";
+
+// Auth
+export { createSpiteStackApp, createSpiteStackAuth } from "./auth";
+
+// Routes
+export { createCommandHandler } from "./routes";

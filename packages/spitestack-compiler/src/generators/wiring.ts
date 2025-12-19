@@ -10,7 +10,13 @@ function capitalize(str: string): string {
 /**
  * Generate the wiring file that connects all handlers
  */
-export function generateWiringFile(aggregates: AggregateAnalysis[]): GeneratedFile {
+export function generateWiringFile(
+  aggregates: AggregateAnalysis[],
+  options?: {
+    allowedCommands?: Map<string, Set<string>>;
+  }
+): GeneratedFile {
+  const allowedCommands = options?.allowedCommands;
   // Generate imports
   const handlerImports = aggregates
     .map((agg) => {
@@ -23,15 +29,35 @@ export function generateWiringFile(aggregates: AggregateAnalysis[]): GeneratedFi
 
   // Generate Command union type
   const commandTypes = aggregates
-    .map((agg) => `${capitalize(agg.aggregateName)}Command`)
+    .map((agg) => {
+      const aggName = agg.aggregateName;
+      const commandType = `${capitalize(aggName)}Command`;
+      const allowed = allowedCommands?.get(aggName);
+      if (!allowed) {
+        return commandType;
+      }
+      const allowedTypes = agg.commands
+        .filter((cmd) => allowed.has(cmd.methodName))
+        .map((cmd) => `"${aggName}.${cmd.methodName}"`)
+        .join(" | ");
+      if (!allowedTypes) {
+        return "never";
+      }
+      return `Extract<${commandType}, { type: ${allowedTypes} }>`;
+    })
+    .filter((entry) => entry !== "never")
     .join(" | ");
+  const resolvedCommandTypes = commandTypes || "never";
 
   // Generate switch cases for command routing
   const switchCases = aggregates.flatMap((agg) => {
     const aggName = agg.aggregateName;
     const handlers = `${aggName}Handlers`;
+    const allowed = allowedCommands?.get(aggName);
 
-    return agg.commands.map((cmd) => {
+    return agg.commands
+      .filter((cmd) => !allowed || allowed.has(cmd.methodName))
+      .map((cmd) => {
       const caseType = `${aggName}.${cmd.methodName}`;
       return `    case "${caseType}":
       return ${handlers}.${cmd.methodName}(ctx, command.payload);`;
@@ -43,20 +69,22 @@ export function generateWiringFile(aggregates: AggregateAnalysis[]): GeneratedFi
  * DO NOT EDIT - regenerate with \`spitestack compile\`
  */
 
-import type { SpiteDB } from "@spitestack/db";
+import type { SpiteDbNapi } from "@spitestack/db";
 ${handlerImports}
 
 /**
  * Union of all command types
  */
-export type Command = ${commandTypes};
+export type Command = ${resolvedCommandTypes};
 
 /**
  * Context required for command execution
  */
 export interface CommandContext {
-  db: SpiteDB;
+  db: SpiteDbNapi;
   commandId: string;
+  tenant: string;
+  actorId?: string;
 }
 
 /**
@@ -97,7 +125,13 @@ ${aggregates.map((agg) => `export { ${agg.aggregateName}Handlers } from "./handl
 /**
  * Generate the index barrel file
  */
-export function generateIndexFile(aggregates: AggregateAnalysis[]): GeneratedFile {
+export function generateIndexFile(
+  aggregates: AggregateAnalysis[],
+  options?: {
+    allowedCommands?: Map<string, Set<string>>;
+  }
+): GeneratedFile {
+  const allowedCommands = options?.allowedCommands;
   const handlerExports = aggregates
     .map((agg) => {
       const aggName = agg.aggregateName;
@@ -110,11 +144,17 @@ export function generateIndexFile(aggregates: AggregateAnalysis[]): GeneratedFil
   const validatorExports = aggregates
     .map((agg) => {
       const aggName = agg.aggregateName;
+      const allowed = allowedCommands?.get(aggName);
       const validators = agg.commands
+        .filter((cmd) => !allowed || allowed.has(cmd.methodName))
         .map((cmd) => `validate${capitalize(aggName)}${capitalize(cmd.methodName)}`)
         .join(", ");
+      if (!validators) {
+        return "";
+      }
       return `export { ${validators} } from "./validators/${aggName}.validator";`;
     })
+    .filter(Boolean)
     .join("\n");
 
   const content = `/**
@@ -130,6 +170,12 @@ ${handlerExports}
 
 // Validators
 ${validatorExports}
+
+// Auth
+export { createSpiteStackApp, createSpiteStackAuth } from "./auth";
+
+// Routes
+export { createCommandHandler } from "./routes";
 `;
 
   return {

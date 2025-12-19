@@ -44,6 +44,8 @@ export interface ProjectionEvent {
   globalPos: bigint;
   /** Stream this event belongs to */
   streamId: string;
+  /** Tenant hash for this event */
+  tenantHash: bigint;
   /** Revision within the stream */
   streamRev: bigint;
   /** Timestamp when stored (Unix milliseconds) */

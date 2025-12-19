@@ -24,12 +24,64 @@ export interface CompilerConfig {
     colors: boolean;
     maxErrors: number;
   };
+  routes: {
+    basePath: string;
+    publicSessionHeader: string;
+    publicSessionRequired: boolean;
+    publicTenantId?: string;
+  };
+  /** App config path if using spitestack.app */
+  appPath?: string | null;
+  /** Raw app config */
+  appConfig?: SpiteStackAppConfig | null;
+  /** App registrations when using App().register */
+  registrations?: SpiteStackRegistration[] | null;
 }
 
 export type PartialConfig = Partial<Omit<CompilerConfig, "generate" | "diagnostics">> & {
   generate?: Partial<CompilerConfig["generate"]>;
   diagnostics?: Partial<CompilerConfig["diagnostics"]>;
 };
+
+export interface SpiteStackAppConfig {
+  domainDir?: string;
+  outDir?: string;
+  include?: string[];
+  exclude?: string[];
+  generate?: {
+    handlers?: boolean;
+    validators?: boolean;
+    wiring?: boolean;
+  };
+  diagnostics?: {
+    colors?: boolean;
+    maxErrors?: number;
+  };
+  routes?: {
+    basePath?: string;
+    publicSessionHeader?: string;
+    publicSessionRequired?: boolean;
+    publicTenantId?: string;
+  };
+  auth?: unknown;
+}
+
+export type SpiteStackScope = "public" | "auth" | "internal";
+
+export type SpiteStackMethodScope =
+  | SpiteStackScope
+  | false
+  | {
+      scope?: SpiteStackScope;
+      roles?: string[];
+    };
+
+export interface SpiteStackRegistration {
+  aggregate: string;
+  scope?: SpiteStackScope;
+  roles?: string[];
+  methods?: Record<string, SpiteStackMethodScope>;
+}
 
 // ============================================================================
 // Analysis Types
@@ -158,4 +210,6 @@ export interface GenerationResult {
   validators: GeneratedFile[];
   wiring: GeneratedFile | null;
   index: GeneratedFile | null;
+  auth: GeneratedFile | null;
+  routes: GeneratedFile | null;
 }

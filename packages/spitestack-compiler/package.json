@@ -9,7 +9,7 @@
     "spitestack": "./dist/index.js"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "build": "bun build ./src/index.ts ./src/app.ts --outdir ./dist --target bun",
     "dev": "bun run ./src/index.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -22,5 +22,9 @@
   },
   "peerDependencies": {
     "@spitestack/db": "workspace:*"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./app": "./src/app.ts"
   }
 }

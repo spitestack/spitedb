@@ -991,6 +991,37 @@ pub struct TenantTombstone {
 }
 
 // =============================================================================
+// SQL Transaction Hooks
+// =============================================================================
+
+/// A parameter value for SQL statements executed inside a write transaction.
+#[derive(Debug, Clone)]
+pub enum SqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+    Bool(bool),
+}
+
+/// A SQL statement executed inside the SpiteDB write transaction.
+#[derive(Debug, Clone)]
+pub struct SqlStatement {
+    pub sql: String,
+    pub params: Vec<SqlValue>,
+}
+
+impl SqlStatement {
+    pub fn new(sql: impl Into<String>, params: Vec<SqlValue>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

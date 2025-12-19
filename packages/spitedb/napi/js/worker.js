@@ -61,6 +61,7 @@ function napiEventToProjectionEvent(event) {
     return {
         globalPos: BigInt(event.globalPos),
         streamId: event.streamId,
+        tenantHash: BigInt(event.tenantHash),
         streamRev: BigInt(event.streamRev),
         timestampMs: BigInt(event.timestampMs),
         data: event.data,

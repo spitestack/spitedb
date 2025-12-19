@@ -78,7 +78,7 @@ use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection, types::Value as SqliteValue};
 use tokio::sync::{mpsc, oneshot, Semaphore, OwnedSemaphorePermit, Mutex as TokioMutex};
 use tokio::time::{timeout, sleep};
 use std::sync::Arc;
@@ -93,8 +93,8 @@ use crate::tombstones::{
 use crate::types::{
     AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId,
     DeleteStreamCommand, DeleteStreamResult, DeleteTenantCommand, DeleteTenantResult, GlobalPos,
-    StreamHash, StreamHeadEntry, StreamId, StreamRev, TenantHash, COMMAND_CACHE_MAX_ENTRIES,
-    COMMAND_CACHE_TTL_MS,
+    SqlStatement, SqlValue, StreamHash, StreamHeadEntry, StreamId, StreamRev, TenantHash,
+    COMMAND_CACHE_MAX_ENTRIES, COMMAND_CACHE_TTL_MS,
 };
 
 // =============================================================================
@@ -458,6 +458,16 @@ pub enum WriteRequest {
     Transaction {
         commands: Vec<AppendCommand>,
         response: oneshot::Sender<Result<Vec<Result<AppendResult>>>>,
+    },
+
+    /// Atomic transaction with optional SQL statements.
+    ///
+    /// All commands must succeed; any conflict or duplicate aborts the transaction.
+    /// SQL statements run inside the same SQLite transaction after event writes.
+    AtomicTransaction {
+        commands: Vec<AppendCommand>,
+        sql_ops: Vec<SqlStatement>,
+        response: oneshot::Sender<Result<Vec<AppendResult>>>,
     },
 
     /// Delete events from a stream (create tombstone).
@@ -1205,7 +1215,13 @@ impl BatchWriter {
         let event_iter = valid_commands.iter()
             .flat_map(|v| flat_commands[v.flat_index].0.events.iter().map(|e| e.data.as_slice()));
 
-        let (batch_data, nonce, event_offsets) = encode_batch_iter(event_iter, base_pos, &self.cryptor)?;
+        let (batch_data, nonce, event_offsets) = match encode_batch_iter(event_iter, base_pos, &self.cryptor) {
+            Ok(result) => result,
+            Err(e) => {
+                self.staged.clear(self.next_pos_committed);
+                return Err(e);
+            }
+        };
         let checksum = compute_checksum(&batch_data);
 
         // =====================================================================
@@ -1213,7 +1229,10 @@ impl BatchWriter {
         // =====================================================================
 
         // Begin transaction
-        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        if let Err(e) = self.conn.execute("BEGIN IMMEDIATE", []) {
+            self.staged.clear(self.next_pos_committed);
+            return Err(e.into());
+        }
 
         // Single INSERT into batches table
         self.conn.prepare_cached(
@@ -1348,6 +1367,205 @@ impl BatchWriter {
         }
     }
 
+    /// Executes an atomic transaction with optional SQL statements.
+    ///
+    /// All commands must succeed; any conflict or duplicate aborts the transaction.
+    fn execute_atomic_transaction(
+        &mut self,
+        commands: Vec<AppendCommand>,
+        sql_ops: Vec<SqlStatement>,
+    ) -> Result<Vec<AppendResult>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Reset staged state for this transaction
+        self.staged.clear(self.next_pos_committed);
+
+        let now_ms = current_time_ms();
+
+        // Flatten commands for validation
+        let mut flat_commands: Vec<&AppendCommand> = Vec::with_capacity(commands.len());
+        for command in &commands {
+            flat_commands.push(command);
+        }
+
+        let mut valid_commands: Vec<ValidatedCommand> = Vec::with_capacity(commands.len());
+
+        for (idx, cmd) in flat_commands.iter().enumerate() {
+            match self.validate_and_prepare_command(cmd, idx, now_ms) {
+                ValidationResult::Valid(validated) => {
+                    valid_commands.push(validated);
+                }
+                ValidationResult::Duplicate(_) => {
+                    self.staged.clear(self.next_pos_committed);
+                    return Err(Error::DuplicateCommand {
+                        command_id: cmd.command_id.to_string(),
+                    });
+                }
+                ValidationResult::Conflict(err) => {
+                    self.staged.clear(self.next_pos_committed);
+                    return Err(err);
+                }
+            }
+        }
+
+        // Calculate total events from valid commands
+        let total_events: usize = valid_commands.iter().map(|v| v.event_count).sum();
+
+        // =====================================================================
+        // Phase 2: Encode ALL events into ONE blob
+        // =====================================================================
+        let base_pos = valid_commands.first().unwrap().first_pos.as_raw() as i64;
+
+        let event_iter = valid_commands.iter().flat_map(|v| {
+            flat_commands[v.flat_index]
+                .events
+                .iter()
+                .map(|e| e.data.as_slice())
+        });
+
+        let (batch_data, nonce, event_offsets) = encode_batch_iter(event_iter, base_pos, &self.cryptor)?;
+        let checksum = compute_checksum(&batch_data);
+
+        // =====================================================================
+        // Phase 3: Database operations
+        // =====================================================================
+
+        // Begin transaction
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+
+        let mut results: Vec<Option<AppendResult>> = vec![None; commands.len()];
+
+        let transaction_result = (|| -> Result<()> {
+            // Single INSERT into batches table
+            self.conn.prepare_cached(
+                "INSERT INTO batches (base_pos, event_count, created_ms, codec, cipher, nonce, checksum, data)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            )?.execute(params![
+                base_pos,
+                total_events as i64,
+                now_ms as i64,
+                CODEC_ZSTD_L1,
+                CIPHER_AES256GCM,
+                nonce.as_slice(),
+                checksum.as_slice(),
+                batch_data.as_slice(),
+            ])?;
+
+            let batch_id = self.conn.last_insert_rowid();
+
+            let mut event_idx_stmt = self.conn.prepare_cached(
+                "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, tenant_hash, collision_slot, stream_rev)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            )?;
+
+            let mut stream_head_stmt = self.conn.prepare_cached(
+                "INSERT INTO stream_heads (stream_id, stream_hash, tenant_hash, collision_slot, last_rev, last_pos)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(stream_id, tenant_hash) DO UPDATE SET
+                     last_rev = excluded.last_rev,
+                     last_pos = excluded.last_pos"
+            )?;
+
+            let mut cmd_stmt = self.conn.prepare_cached(
+                "INSERT INTO commands (tenant_hash, command_id, stream_id, stream_hash, first_pos, last_pos, first_rev, last_rev, created_ms)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )?;
+
+            let mut global_offset_idx = 0usize;
+
+            for validated in &valid_commands {
+                let mut pos = validated.first_pos;
+                let mut rev = validated.first_rev;
+
+                for _ in 0..validated.event_count {
+                    let (byte_offset, byte_len) = event_offsets[global_offset_idx];
+                    event_idx_stmt.execute(params![
+                        pos.as_raw() as i64,
+                        batch_id,
+                        byte_offset as i64,
+                        byte_len as i64,
+                        validated.stream_hash.as_raw(),
+                        validated.tenant_hash.as_raw(),
+                        validated.collision_slot.as_raw() as i64,
+                        rev.as_raw() as i64,
+                    ])?;
+                    pos = pos.next();
+                    rev = rev.next();
+                    global_offset_idx += 1;
+                }
+
+                let cmd = flat_commands[validated.flat_index];
+
+                stream_head_stmt.execute(params![
+                    cmd.stream_id.as_str(),
+                    validated.stream_hash.as_raw(),
+                    validated.tenant_hash.as_raw(),
+                    validated.collision_slot.as_raw() as i64,
+                    validated.last_rev.as_raw() as i64,
+                    validated.last_pos.as_raw() as i64,
+                ])?;
+
+                cmd_stmt.execute(params![
+                    validated.tenant_hash.as_raw(),
+                    cmd.command_id.as_str(),
+                    cmd.stream_id.as_str(),
+                    validated.stream_hash.as_raw(),
+                    validated.first_pos.as_raw() as i64,
+                    validated.last_pos.as_raw() as i64,
+                    validated.first_rev.as_raw() as i64,
+                    validated.last_rev.as_raw() as i64,
+                    now_ms as i64,
+                ])?;
+
+                let result = AppendResult::new(
+                    validated.first_pos,
+                    validated.last_pos,
+                    validated.first_rev,
+                    validated.last_rev,
+                );
+                results[validated.flat_index] = Some(result);
+            }
+
+            drop(event_idx_stmt);
+            drop(stream_head_stmt);
+            drop(cmd_stmt);
+
+            if !sql_ops.is_empty() {
+                self.execute_sql_ops(&sql_ops)?;
+            }
+
+            Ok(())
+        })();
+
+        match transaction_result {
+            Ok(()) => {
+                let commit_result = self.conn.execute("COMMIT", []);
+                match commit_result {
+                    Ok(_) => {
+                        self.commit_staged_state();
+                        let out = results
+                            .into_iter()
+                            .map(|r| r.expect("missing append result for atomic transaction"))
+                            .collect();
+                        Ok(out)
+                    }
+                    Err(e) => {
+                        let _ = self.conn.execute("ROLLBACK", []);
+                        self.staged.clear(self.next_pos_committed);
+                        Err(e.into())
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+                self.staged.clear(self.next_pos_committed);
+                Err(e)
+            }
+        }
+    }
+
     /// Commits staged state to committed state.
     ///
     /// This:
@@ -1379,6 +1597,26 @@ impl BatchWriter {
         for (key, entry) in self.staged.staged_commands.drain() {
             self.commands.put(key, entry);
         }
+    }
+
+    /// Executes additional SQL statements inside the current write transaction.
+    fn execute_sql_ops(&mut self, sql_ops: &[SqlStatement]) -> Result<()> {
+        for op in sql_ops {
+            if op.params.is_empty() {
+                self.conn.execute(op.sql.as_str(), [])?;
+                continue;
+            }
+
+            let params = op
+                .params
+                .iter()
+                .map(sql_value_to_sqlite)
+                .collect::<Vec<SqliteValue>>();
+            let mut stmt = self.conn.prepare_cached(op.sql.as_str())?;
+            stmt.execute(params_from_iter(params))?;
+        }
+
+        Ok(())
     }
 
     // =========================================================================
@@ -1988,6 +2226,15 @@ impl BatchWriterHandle {
         }
     }
 
+    /// Creates an atomic transaction with optional SQL statements.
+    pub fn begin_atomic_transaction(&self) -> AtomicTransactionBuilder {
+        AtomicTransactionBuilder {
+            commands: Vec::new(),
+            sql_ops: Vec::new(),
+            handle: self.clone(),
+        }
+    }
+
     /// Submits a transaction.
     ///
     /// # Admission Control
@@ -2027,6 +2274,63 @@ impl BatchWriterHandle {
         let result = timeout(remaining, response_rx)
             .await
             .map_err(|_| Error::Timeout("timeout waiting for transaction response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?;
+
+        // Record latency
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.admission.record_latency(latency_us).await;
+            self.admission.metrics.requests_accepted.fetch_add(1, Ordering::Relaxed);
+        }
+
+        drop(permits);
+        result
+    }
+
+    /// Submits an atomic transaction with optional SQL statements.
+    ///
+    /// All commands must succeed; any conflict or duplicate aborts the transaction.
+    pub async fn submit_atomic_transaction(
+        &self,
+        commands: Vec<AppendCommand>,
+        sql_ops: Vec<SqlStatement>,
+    ) -> Result<Vec<AppendResult>> {
+        if commands.is_empty() {
+            if sql_ops.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(Error::Schema(
+                "atomic transaction requires at least one append command".into(),
+            ));
+        }
+
+        let deadline = Instant::now() + self.admission.default_deadline();
+
+        // Count total events across all commands
+        let total_events: usize = commands.iter().map(|c| c.events.len()).sum();
+
+        // Acquire permits for all events
+        let permits = self.admission.acquire_permits(total_events, deadline).await?;
+
+        let start = Instant::now();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Send with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, self.tx.send(WriteRequest::AtomicTransaction {
+            commands,
+            sql_ops,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending atomic transaction to writer".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
+
+        // Wait for response with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = timeout(remaining, response_rx)
+            .await
+            .map_err(|_| Error::Timeout("timeout waiting for atomic transaction response".into()))?
             .map_err(|_| Error::Schema("writer dropped response".into()))?;
 
         // Record latency
@@ -2196,6 +2500,56 @@ impl TransactionBuilder {
     }
 }
 
+/// Builder for atomic transactions that may include SQL statements.
+///
+/// All appended commands must succeed; any conflict or duplicate aborts the
+/// transaction and no SQL statements are applied.
+pub struct AtomicTransactionBuilder {
+    commands: Vec<AppendCommand>,
+    sql_ops: Vec<SqlStatement>,
+    handle: BatchWriterHandle,
+}
+
+impl AtomicTransactionBuilder {
+    /// Adds a command to the transaction.
+    pub fn append(&mut self, command: AppendCommand) -> &mut Self {
+        self.commands.push(command);
+        self
+    }
+
+    /// Adds a SQL statement to run inside the write transaction.
+    pub fn exec_sql(&mut self, sql: impl Into<String>, params: Vec<SqlValue>) -> &mut Self {
+        self.sql_ops.push(SqlStatement::new(sql, params));
+        self
+    }
+
+    /// Adds a pre-built SQL statement to run inside the write transaction.
+    pub fn push_sql(&mut self, statement: SqlStatement) -> &mut Self {
+        self.sql_ops.push(statement);
+        self
+    }
+
+    /// Submits the transaction.
+    ///
+    /// Returns append results for each command in order. If any command fails,
+    /// the entire transaction is aborted and no SQL statements are applied.
+    pub async fn submit(self) -> Result<Vec<AppendResult>> {
+        self.handle
+            .submit_atomic_transaction(self.commands, self.sql_ops)
+            .await
+    }
+
+    /// Returns the number of commands in the transaction.
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Returns true if the transaction has no commands.
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+}
+
 // =============================================================================
 // Writer Loop
 // =============================================================================
@@ -2203,6 +2557,17 @@ impl TransactionBuilder {
 /// Calculates the total payload bytes for an AppendCommand.
 fn command_payload_bytes(cmd: &AppendCommand) -> usize {
     cmd.events.iter().map(|e| e.data.len()).sum()
+}
+
+fn sql_value_to_sqlite(value: &SqlValue) -> SqliteValue {
+    match value {
+        SqlValue::Null => SqliteValue::Null,
+        SqlValue::Integer(v) => SqliteValue::Integer(*v),
+        SqlValue::Real(v) => SqliteValue::Real(*v),
+        SqlValue::Text(v) => SqliteValue::Text(v.clone()),
+        SqlValue::Blob(v) => SqliteValue::Blob(v.clone()),
+        SqlValue::Bool(v) => SqliteValue::Integer(if *v { 1 } else { 0 }),
+    }
 }
 
 /// Runs the batch writer loop.
@@ -2274,6 +2639,17 @@ pub async fn run_batch_writer(
                     batch_start = None;
                     batch_bytes = 0;
                 }
+            }
+            Ok(Some(WriteRequest::AtomicTransaction { commands, sql_ops, response })) => {
+                // Atomic transactions are handled immediately (not batched)
+                if !batch.is_empty() {
+                    writer.execute_batch(std::mem::take(&mut batch));
+                    batch_start = None;
+                    batch_bytes = 0;
+                }
+
+                let result = writer.execute_atomic_transaction(commands, sql_ops);
+                let _ = response.send(result);
             }
             Ok(Some(WriteRequest::DeleteStream { command, response })) => {
                 // Delete requests are handled immediately (not batched)

@@ -44,6 +44,7 @@ interface ColumnDefNapi {
 interface EventNapi {
   globalPos: number;
   streamId: string;
+  tenantHash: number;
   streamRev: number;
   timestampMs: number;
   data: Buffer;
@@ -111,6 +112,7 @@ function napiEventToProjectionEvent(event: EventNapi): ProjectionEvent {
   return {
     globalPos: BigInt(event.globalPos),
     streamId: event.streamId,
+    tenantHash: BigInt(event.tenantHash),
     streamRev: BigInt(event.streamRev),
     timestampMs: BigInt(event.timestampMs),
     data: event.data,

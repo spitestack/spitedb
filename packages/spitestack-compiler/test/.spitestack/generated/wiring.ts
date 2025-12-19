@@ -3,20 +3,22 @@
  * DO NOT EDIT - regenerate with `spitestack compile`
  */
 
-import type { SpiteDB } from "@spitestack/db";
+import type { SpiteDbNapi } from "@spitestack/db";
 import { todoHandlers, type TodoCommand } from "./handlers/todo.handler";
 
 /**
  * Union of all command types
  */
-export type Command = TodoCommand;
+export type Command = Extract<TodoCommand, { type: "todo.create" | "todo.complete" | "todo.rename" }>;
 
 /**
  * Context required for command execution
  */
 export interface CommandContext {
-  db: SpiteDB;
+  db: SpiteDbNapi;
   commandId: string;
+  tenant: string;
+  actorId?: string;
 }
 
 /**

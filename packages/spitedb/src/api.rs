@@ -85,7 +85,7 @@ use crate::types::{
     AppendCommand, AppendResult, CommandId, DeleteStreamCommand, DeleteStreamResult,
     DeleteTenantCommand, DeleteTenantResult, Event, GlobalPos, StreamId, StreamRev, Tenant,
 };
-use crate::writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer};
+use crate::writer::{AtomicTransactionBuilder, BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer};
 
 // =============================================================================
 // Configuration
@@ -382,6 +382,14 @@ impl SpiteDB {
     /// contains a result for each command in submission order.
     pub fn begin_transaction(&self) -> TransactionBuilder {
         self.writer.begin_transaction()
+    }
+
+    /// Begins an atomic transaction with optional SQL statements.
+    ///
+    /// All commands must succeed; any conflict or duplicate aborts the
+    /// transaction and no SQL statements are applied.
+    pub fn begin_atomic_transaction(&self) -> AtomicTransactionBuilder {
+        self.writer.begin_atomic_transaction()
     }
 
     /// Reads events from a specific stream.

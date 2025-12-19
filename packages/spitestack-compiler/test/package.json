@@ -1,0 +1,8 @@
+{
+  "name": "@spitestack/compiler-test",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "better-auth": "latest"
+  }
+}
