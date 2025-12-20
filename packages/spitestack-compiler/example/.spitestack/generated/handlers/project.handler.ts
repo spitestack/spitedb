@@ -1,17 +1,17 @@
 /**
- * Auto-generated handler for TodoAggregate
+ * Auto-generated handler for ProjectAggregate
  * DO NOT EDIT - regenerate with `spitestack compile`
  *
- * @generated from Todo/aggregate.ts
+ * @generated from aggregates/Project/aggregate.ts
  */
 
 import type { SpiteDbNapi } from "@spitestack/db";
-import { TodoAggregate } from "../../../src/domain/aggregates/Todo/aggregate";
-import type { TodoEvent } from "../../../src/domain/aggregates/Todo/events";
+import { ProjectAggregate } from "../../../src/domain/aggregates/Project/aggregate";
+import type { ProjectEvent } from "../../../src/domain/aggregates/Project/events";
 import {
-  validateTodoCreate, validateTodoComplete, validateTodoRename,
+  validateProjectCreate, validateProjectAddTodo, validateProjectRemoveTodo,
   type ValidationError as ValidationErrorType,
-} from "../validators/todo.validator";
+} from "../validators/project.validator";
 
 /**
  * Error thrown when validation fails
@@ -29,25 +29,26 @@ export interface CommandResult {
   events: unknown[];
 }
 
-export interface TodoCommandContext {
+export interface ProjectCommandContext {
   db: SpiteDbNapi;
   commandId: string;
   tenant: string;
   actorId?: string;
 }
 
-export interface TodoCreateInput {
+export interface ProjectCreateInput {
   id: string;
-  title: string;
+  name: string;
 }
 
-export interface TodoCompleteInput {
+export interface ProjectAddTodoInput {
   id: string;
+  todoId: string;
 }
 
-export interface TodoRenameInput {
+export interface ProjectRemoveTodoInput {
   id: string;
-  title: string;
+  todoId: string;
 }
 
 /**
@@ -79,18 +80,18 @@ function wrapEvent<T>(event: T, tenantId: string, actorId?: string): EventEnvelo
 }
 
 async function executeCommand<TInput extends { id: string }>(
-  ctx: TodoCommandContext,
+  ctx: ProjectCommandContext,
   input: TInput,
-  execute: (aggregate: TodoAggregate) => void
+  execute: (aggregate: ProjectAggregate) => void
 ): Promise<CommandResult> {
   // Load existing events for this aggregate (fromRev=0, limit=10000)
   const existingEvents = await ctx.db.readStream(input.id, 0, 10000, ctx.tenant);
 
   // Create aggregate and replay events to reconstruct state
-  const aggregate = new TodoAggregate();
+  const aggregate = new ProjectAggregate();
 
   for (const event of existingEvents) {
-    const parsed = JSON.parse(event.data.toString()) as TodoEvent | EventEnvelope<TodoEvent>;
+    const parsed = JSON.parse(event.data.toString()) as ProjectEvent | EventEnvelope<ProjectEvent>;
     aggregate.apply(unwrapEvent(parsed));
   }
 
@@ -108,20 +109,18 @@ async function executeCommand<TInput extends { id: string }>(
     };
   }
 
-  // Persist to SpiteDB
+  // Persist to SpiteDB using optimized JSON path
   // expectedRev: 0 means stream must not exist, -1 means any revision
   const expectedRev = existingEvents.length === 0 ? 0 : existingEvents.length;
-  const eventBuffers = newEvents.map((e) =>
-    Buffer.from(JSON.stringify(wrapEvent(e, ctx.tenant, ctx.actorId)))
-  );
-
-  const result = await ctx.db.append(
-    input.id,
-    ctx.commandId,
+  const payload = JSON.stringify({
+    streamId: input.id,
+    commandId: ctx.commandId,
     expectedRev,
-    eventBuffers,
-    ctx.tenant
-  );
+    events: newEvents.map((e) => wrapEvent(e, ctx.tenant, ctx.actorId)),
+    tenant: ctx.tenant,
+  });
+
+  const result = await ctx.db.appendStreamJson(payload);
 
   return {
     aggregateId: input.id,
@@ -130,45 +129,45 @@ async function executeCommand<TInput extends { id: string }>(
   };
 }
 
-export const todoHandlers = {
-  async create(ctx: TodoCommandContext, input: TodoCreateInput): Promise<CommandResult> {
-    const result = validateTodoCreate(input);
+export const projectHandlers = {
+  async create(ctx: ProjectCommandContext, input: ProjectCreateInput): Promise<CommandResult> {
+    const result = validateProjectCreate(input);
     if (!result.success) {
       throw new ValidationError(result.errors);
     }
     const validated = result.data;
 
     return executeCommand(ctx, validated, (agg) => {
-      agg.create(validated.title);
+      agg.create(validated.name);
     });
   },
 
-  async complete(ctx: TodoCommandContext, input: TodoCompleteInput): Promise<CommandResult> {
-    const result = validateTodoComplete(input);
+  async addTodo(ctx: ProjectCommandContext, input: ProjectAddTodoInput): Promise<CommandResult> {
+    const result = validateProjectAddTodo(input);
     if (!result.success) {
       throw new ValidationError(result.errors);
     }
     const validated = result.data;
 
     return executeCommand(ctx, validated, (agg) => {
-      agg.complete();
+      agg.addTodo(validated.todoId);
     });
   },
 
-  async rename(ctx: TodoCommandContext, input: TodoRenameInput): Promise<CommandResult> {
-    const result = validateTodoRename(input);
+  async removeTodo(ctx: ProjectCommandContext, input: ProjectRemoveTodoInput): Promise<CommandResult> {
+    const result = validateProjectRemoveTodo(input);
     if (!result.success) {
       throw new ValidationError(result.errors);
     }
     const validated = result.data;
 
     return executeCommand(ctx, validated, (agg) => {
-      agg.rename(validated.title);
+      agg.removeTodo(validated.todoId);
     });
   }
 };
 
-export type TodoCommand =
-  | { type: "todo.create"; payload: TodoCreateInput }
-  | { type: "todo.complete"; payload: TodoCompleteInput }
-  | { type: "todo.rename"; payload: TodoRenameInput };
+export type ProjectCommand =
+  | { type: "project.create"; payload: ProjectCreateInput }
+  | { type: "project.addTodo"; payload: ProjectAddTodoInput }
+  | { type: "project.removeTodo"; payload: ProjectRemoveTodoInput };

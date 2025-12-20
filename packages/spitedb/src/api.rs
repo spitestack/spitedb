@@ -392,6 +392,18 @@ impl SpiteDB {
         self.writer.begin_atomic_transaction()
     }
 
+    /// Appends events to multiple streams atomically via batch fsync.
+    ///
+    /// All expected revisions are validated upfront. If all pass, events are
+    /// staged and committed together via batch fsync. If any validation fails,
+    /// no events are staged and an error is returned.
+    ///
+    /// This is faster than `begin_atomic_transaction` for multi-stream appends
+    /// without SQL statements.
+    pub async fn batch_append(&self, commands: Vec<AppendCommand>) -> Result<Vec<AppendResult>> {
+        self.writer.submit_batch_append(commands).await
+    }
+
     /// Reads events from a specific stream.
     ///
     /// # Arguments

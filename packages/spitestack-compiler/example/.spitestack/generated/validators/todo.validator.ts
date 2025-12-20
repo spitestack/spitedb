@@ -2,7 +2,7 @@
  * Auto-generated validators for TodoAggregate
  * DO NOT EDIT - regenerate with `spitestack compile`
  *
- * @generated from Todo/aggregate.ts
+ * @generated from aggregates/Todo/aggregate.ts
  */
 
 /**

@@ -115,3 +115,13 @@ export function getEndLineAndColumn(
 export function getNodeText(node: ts.Node, sourceFile: ts.SourceFile): string {
   return node.getText(sourceFile);
 }
+
+/**
+ * Parse orchestrator files (same logic as parseFiles)
+ */
+export function parseOrchestratorFiles(files: DiscoveredFile[]): {
+  program: ts.Program;
+  parsedFiles: ParsedFile[];
+} {
+  return parseFiles(files);
+}

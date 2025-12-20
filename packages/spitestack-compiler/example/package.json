@@ -1,5 +1,5 @@
 {
-  "name": "@spitestack/compiler-test",
+  "name": "@spitestack/compiler-example",
   "private": true,
   "type": "module",
   "dependencies": {

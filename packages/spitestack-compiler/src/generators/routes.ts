@@ -48,10 +48,11 @@ export function generateRoutesFile(
  */
 
 import type { SpiteDbNapi } from "@spitestack/db";
-import { DEFAULT_TENANT } from "@spitestack/db";
 import type { Auth } from "better-auth";
 import { executeCommand, type Command } from "./wiring";
 ${appImport}
+
+const DEFAULT_TENANT = "default";
 
 type RouteScope = "public" | "auth" | "internal";
 

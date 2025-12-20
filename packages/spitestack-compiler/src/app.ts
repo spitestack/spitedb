@@ -97,9 +97,35 @@ export interface SpiteStackRegistration {
   methods?: Record<string, SpiteStackMethodScope>;
 }
 
+/**
+ * Registration for an adapter (external service client).
+ * Adapters are injected into orchestrators at runtime.
+ */
+export interface SpiteStackAdapterRegistration<T = unknown> {
+  /** Unique name for the adapter (used to match constructor params) */
+  name: string;
+  /** The adapter instance */
+  instance: T;
+}
+
+/**
+ * Registration for an orchestrator.
+ * Orchestrators coordinate multiple aggregates and external services.
+ */
+export interface SpiteStackOrchestratorRegistration {
+  /** The orchestrator class */
+  orchestrator: new (...args: unknown[]) => { orchestrate: (...args: unknown[]) => Promise<void> };
+  /** Access scope for the orchestrator route */
+  scope?: SpiteStackScope;
+  /** Required roles (for auth scope) */
+  roles?: string[];
+  /** Custom route path (defaults to /orchestrators/{name}) */
+  route?: string;
+}
+
 const DEFAULT_CONFIG: SpiteStackResolvedConfig = {
   mode: "greenfield",
-  domainDir: "./src/domain/aggregates",
+  domainDir: "./src/domain",
   outDir: "./.spitestack/generated",
   include: ["**/*.ts"],
   exclude: ["**/*.test.ts", "**/*.spec.ts"],
@@ -166,6 +192,8 @@ function mergeConfig(config: SpiteStackAppConfig = {}): SpiteStackResolvedConfig
 export class SpiteStackApp {
   readonly config: SpiteStackResolvedConfig;
   readonly registrations: SpiteStackRegistration[] = [];
+  readonly adapters: Map<string, unknown> = new Map();
+  readonly orchestrators: SpiteStackOrchestratorRegistration[] = [];
 
   constructor(config: SpiteStackAppConfig = {}) {
     this.config = mergeConfig(config);
@@ -182,6 +210,41 @@ export class SpiteStackApp {
       roles: options.roles,
       methods: options.methods,
     });
+    return this;
+  }
+
+  /**
+   * Register an adapter (external service client).
+   * Adapters are injected into orchestrators by matching the constructor param type name.
+   *
+   * @example
+   * ```ts
+   * App()
+   *   .adapter("stripe", new StripeAdapter(process.env.STRIPE_SECRET_KEY!))
+   *   .adapter("email", new EmailAdapter())
+   * ```
+   */
+  adapter<T>(name: string, instance: T): this {
+    this.adapters.set(name, instance);
+    return this;
+  }
+
+  /**
+   * Register an orchestrator.
+   * Orchestrators coordinate multiple aggregates and external services in a single transaction.
+   *
+   * @example
+   * ```ts
+   * App()
+   *   .orchestrator({
+   *     orchestrator: CreatePaymentIntentOrchestrator,
+   *     scope: "auth",
+   *     route: "/payments/create-intent",
+   *   })
+   * ```
+   */
+  orchestrator(registration: SpiteStackOrchestratorRegistration): this {
+    this.orchestrators.push(registration);
     return this;
   }
 }

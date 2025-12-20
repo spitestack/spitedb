@@ -197,6 +197,80 @@ export interface AggregateAnalysis {
 }
 
 // ============================================================================
+// Orchestrator Analysis Types
+// ============================================================================
+
+/**
+ * Dependency type detected from constructor parameter.
+ * - "aggregate": Needs to be loaded from event store
+ * - "adapter": Needs to be injected from App().adapter() registration
+ */
+export type OrchestratorDependencyKind = "aggregate" | "adapter";
+
+/**
+ * A dependency of an orchestrator, inferred from constructor parameters.
+ */
+export interface OrchestratorDependency {
+  /** Parameter name (e.g., "order") */
+  name: string;
+  /** Type name (e.g., "OrderAggregate" or "StripeAdapter") */
+  typeName: string;
+  /** Kind of dependency */
+  kind: OrchestratorDependencyKind;
+  /** For aggregates: inferred ID param name (e.g., "orderId") */
+  idParamName?: string;
+  /** AST node for the parameter */
+  node: ts.ParameterDeclaration;
+}
+
+/**
+ * Parameter info for the orchestrate() method.
+ */
+export interface OrchestrateMethodParam {
+  name: string;
+  type: TypeInfo;
+  optional: boolean;
+  node: ts.ParameterDeclaration;
+}
+
+/**
+ * Analysis result for an orchestrator class.
+ */
+export interface OrchestratorAnalysis {
+  /** Class name (e.g., "CreatePaymentIntentOrchestrator") */
+  className: string;
+  /** Derived orchestrator name (e.g., "createPaymentIntent") */
+  orchestratorName: string;
+  /** Source file path */
+  filePath: string;
+  /** Relative path from domain dir */
+  relativePath: string;
+  /** Constructor dependencies */
+  dependencies: OrchestratorDependency[];
+  /** orchestrate() method parameters (can be object or separate params) */
+  orchestrateParams: OrchestrateMethodParam[];
+  /** Whether orchestrate params are a single object vs separate params */
+  paramsStyle: "object" | "separate";
+  /** AST node for the class */
+  node: ts.ClassDeclaration;
+}
+
+/**
+ * Combined input type for the generated handler.
+ * Merges aggregate IDs + orchestrate() params.
+ */
+export interface OrchestratorHandlerInput {
+  /** All parameters the handler needs */
+  params: Array<{
+    name: string;
+    type: TypeInfo;
+    optional: boolean;
+    /** Where this param comes from */
+    source: "aggregate-id" | "orchestrate-input";
+  }>;
+}
+
+// ============================================================================
 // Diagnostic Types
 // ============================================================================
 
@@ -232,6 +306,7 @@ export interface ValidationResult {
   valid: boolean;
   diagnostics: Diagnostic[];
   aggregates: AggregateAnalysis[];
+  orchestrators: OrchestratorAnalysis[];
 }
 
 // ============================================================================
@@ -246,6 +321,7 @@ export interface GeneratedFile {
 export interface GenerationResult {
   handlers: GeneratedFile[];
   validators: GeneratedFile[];
+  orchestratorHandlers: GeneratedFile[];
   wiring: GeneratedFile | null;
   index: GeneratedFile | null;
   auth: GeneratedFile | null;

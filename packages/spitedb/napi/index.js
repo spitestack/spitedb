@@ -314,5 +314,7 @@ const { SpiteDbNapi } = nativeBinding
 
 module.exports.SpiteDbNapi = SpiteDbNapi
 
-// Default tenant for single-tenant applications
-module.exports.DEFAULT_TENANT = "default"
+module.exports.SpiteDBNapi = SpiteDbNapi
+
+// Default tenant for single-tenant apps
+module.exports.DEFAULT_TENANT = 'default'

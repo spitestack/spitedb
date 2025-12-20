@@ -107,7 +107,7 @@ use crate::types::{
 /// Shorter = lower latency, longer = higher throughput.
 /// With adaptive admission control, larger batches improve throughput
 /// while admission control protects p99 latency.
-pub const DEFAULT_BATCH_TIMEOUT_MS: u64 = 10;
+pub const DEFAULT_BATCH_TIMEOUT_MS: u64 = 20;
 
 /// Maximum commands per batch.
 ///
@@ -470,6 +470,20 @@ pub enum WriteRequest {
         response: oneshot::Sender<Result<Vec<AppendResult>>>,
     },
 
+    /// Batch append to multiple streams with all-or-nothing semantics.
+    ///
+    /// All expected revisions are validated upfront. If all pass, events are
+    /// staged and committed together via batch fsync. If any validation fails,
+    /// no events are staged and an error is returned.
+    ///
+    /// This provides atomicity through the batch fsync mechanism (not SQLite
+    /// transactions), making it faster than AtomicTransaction for multi-stream
+    /// appends without SQL statements.
+    BatchAppend {
+        commands: Vec<AppendCommand>,
+        response: oneshot::Sender<Result<Vec<AppendResult>>>,
+    },
+
     /// Delete events from a stream (create tombstone).
     DeleteStream {
         command: DeleteStreamCommand,
@@ -508,28 +522,39 @@ struct PendingTransaction {
     response: oneshot::Sender<Result<Vec<Result<AppendResult>>>>,
 }
 
-/// Batch item - either a single command or part of a transaction.
+/// Internal representation of a pending batch append (all-or-nothing).
+struct PendingBatchAppend {
+    commands: Vec<AppendCommand>,
+    response: oneshot::Sender<Result<Vec<AppendResult>>>,
+}
+
+/// Batch item - either a single command, transaction, or batch append.
 enum BatchItem {
     Single(PendingCommand),
     Transaction(PendingTransaction),
+    BatchAppend(PendingBatchAppend),
 }
 
 /// Command extracted from batch item (without response channel).
 enum BatchCommand {
     Single(AppendCommand),
     Transaction(Vec<AppendCommand>),
+    BatchAppend(Vec<AppendCommand>),
 }
 
 /// Response channel extracted from batch item.
 enum BatchResponse {
     Single(oneshot::Sender<Result<AppendResult>>),
     Transaction(oneshot::Sender<Result<Vec<Result<AppendResult>>>>),
+    BatchAppend(oneshot::Sender<Result<Vec<AppendResult>>>),
 }
 
 /// Result for a batch item.
 enum BatchResult {
     Single(Result<AppendResult>),
     Transaction(Vec<Result<AppendResult>>),
+    /// All-or-nothing result: either all succeeded or an error
+    BatchAppend(Result<Vec<AppendResult>>),
 }
 
 // =============================================================================
@@ -681,6 +706,24 @@ impl BatchWriter {
 
         // Initialize staged state
         writer.staged = StagedState::new(writer.next_pos_committed);
+
+        // Log SQLite configuration for profiling
+        let journal_mode: String = writer.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap_or_default();
+        let synchronous: i64 = writer.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap_or(-1);
+        let wal_autocheckpoint: i64 = writer.conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0)).unwrap_or(-1);
+        let cache_size: i64 = writer.conn.query_row("PRAGMA cache_size", [], |r| r.get(0)).unwrap_or(0);
+        let page_size: i64 = writer.conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0);
+        let mmap_size: i64 = writer.conn.query_row("PRAGMA mmap_size", [], |r| r.get(0)).unwrap_or(0);
+
+        eprintln!(
+            "[sqlite-config] journal={} synchronous={} wal_autocheckpoint={} cache_size={} page_size={} mmap_size={}",
+            journal_mode,
+            match synchronous { 0 => "OFF", 1 => "NORMAL", 2 => "FULL", 3 => "EXTRA", _ => "UNKNOWN" },
+            wal_autocheckpoint,
+            cache_size,
+            page_size,
+            mmap_size,
+        );
 
         Ok(writer)
     }
@@ -1069,6 +1112,12 @@ impl BatchWriter {
                     commands.push(BatchCommand::Transaction(pending.commands));
                     responses.push(BatchResponse::Transaction(pending.response));
                 }
+                BatchItem::BatchAppend(pending) => {
+                    // BatchAppend has all-or-nothing semantics - if any command fails
+                    // validation, the entire batch append fails (handled in execute_batch_inner)
+                    commands.push(BatchCommand::BatchAppend(pending.commands));
+                    responses.push(BatchResponse::BatchAppend(pending.response));
+                }
             }
         }
 
@@ -1094,6 +1143,9 @@ impl BatchWriter {
                         (BatchResponse::Transaction(sender), BatchResult::Transaction(r)) => {
                             let _ = sender.send(Ok(r));
                         }
+                        (BatchResponse::BatchAppend(sender), BatchResult::BatchAppend(r)) => {
+                            let _ = sender.send(r);
+                        }
                         _ => unreachable!("mismatched response/result types"),
                     }
                 }
@@ -1108,6 +1160,9 @@ impl BatchWriter {
                             let _ = sender.send(Err(Error::Schema(err_msg.clone())));
                         }
                         BatchResponse::Transaction(sender) => {
+                            let _ = sender.send(Err(Error::Schema(err_msg.clone())));
+                        }
+                        BatchResponse::BatchAppend(sender) => {
                             let _ = sender.send(Err(Error::Schema(err_msg.clone())));
                         }
                     }
@@ -1129,6 +1184,8 @@ impl BatchWriter {
     /// 5. For each valid command: INSERT event_index entries, UPSERT stream_heads
     /// 6. INSERT into commands table (durable idempotency)
     fn execute_batch_inner(&mut self, commands: &[BatchCommand]) -> Result<Vec<BatchResult>> {
+        let t_start = Instant::now();
+
         // =====================================================================
         // Phase 1: Validate all commands, collect events from valid ones
         // =====================================================================
@@ -1136,15 +1193,22 @@ impl BatchWriter {
         let now_ms = current_time_ms();
 
         // Flatten commands for validation
-        let mut flat_commands: Vec<(&AppendCommand, usize, Option<usize>)> = Vec::new();
+        // Track: (command, batch_idx, sub_idx, is_batch_append)
+        // For BatchAppend: sub_idx is Some(index within the batch append)
+        let mut flat_commands: Vec<(&AppendCommand, usize, Option<usize>, bool)> = Vec::new();
         for (batch_idx, cmd) in commands.iter().enumerate() {
             match cmd {
                 BatchCommand::Single(command) => {
-                    flat_commands.push((command, batch_idx, None));
+                    flat_commands.push((command, batch_idx, None, false));
                 }
                 BatchCommand::Transaction(cmds) => {
                     for (tx_idx, command) in cmds.iter().enumerate() {
-                        flat_commands.push((command, batch_idx, Some(tx_idx)));
+                        flat_commands.push((command, batch_idx, Some(tx_idx), false));
+                    }
+                }
+                BatchCommand::BatchAppend(cmds) => {
+                    for (ba_idx, command) in cmds.iter().enumerate() {
+                        flat_commands.push((command, batch_idx, Some(ba_idx), true));
                     }
                 }
             }
@@ -1152,6 +1216,9 @@ impl BatchWriter {
 
         // Validate each command (no event collection - we'll iterate later)
         let mut valid_commands: Vec<ValidatedCommand> = Vec::new();
+
+        // Track which BatchAppend batches have failed (for all-or-nothing semantics)
+        let mut failed_batch_appends: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Pre-allocate result slots
         let mut results: Vec<BatchResult> = commands
@@ -1165,32 +1232,66 @@ impl BatchWriter {
                             .collect()
                     )
                 }
+                BatchCommand::BatchAppend(cmds) => {
+                    // Pre-allocate for all commands, will be replaced with Ok or Err
+                    BatchResult::BatchAppend(Ok(
+                        (0..cmds.len())
+                            .map(|_| AppendResult {
+                                first_pos: GlobalPos::from_raw(0),
+                                last_pos: GlobalPos::from_raw(0),
+                                first_rev: StreamRev::from_raw(0),
+                                last_rev: StreamRev::from_raw(0),
+                            })
+                            .collect()
+                    ))
+                }
             })
             .collect();
 
-        for (idx, (cmd, batch_idx, tx_idx)) in flat_commands.iter().enumerate() {
+        for (idx, (cmd, batch_idx, sub_idx, is_batch_append)) in flat_commands.iter().enumerate() {
+            // Skip commands from BatchAppend batches that have already failed
+            if *is_batch_append && failed_batch_appends.contains(batch_idx) {
+                continue;
+            }
+
             match self.validate_and_prepare_command(cmd, idx, now_ms) {
                 ValidationResult::Valid(validated) => {
                     valid_commands.push(validated);
                 }
                 ValidationResult::Duplicate(cached_result) => {
-                    // Return cached result
-                    match tx_idx {
-                        None => results[*batch_idx] = BatchResult::Single(Ok(cached_result)),
-                        Some(ti) => {
-                            if let BatchResult::Transaction(ref mut tx_results) = results[*batch_idx] {
-                                tx_results[*ti] = Ok(cached_result);
+                    // Handle duplicates
+                    if *is_batch_append {
+                        // For BatchAppend: a duplicate is also a failure (all-or-nothing)
+                        failed_batch_appends.insert(*batch_idx);
+                        results[*batch_idx] = BatchResult::BatchAppend(Err(Error::DuplicateCommand {
+                            command_id: cmd.command_id.to_string(),
+                        }));
+                    } else {
+                        // For Single/Transaction: return cached result for this command
+                        match sub_idx {
+                            None => results[*batch_idx] = BatchResult::Single(Ok(cached_result)),
+                            Some(ti) => {
+                                if let BatchResult::Transaction(ref mut tx_results) = results[*batch_idx] {
+                                    tx_results[*ti] = Ok(cached_result);
+                                }
                             }
                         }
                     }
                 }
                 ValidationResult::Conflict(err) => {
-                    // Return conflict error
-                    match tx_idx {
-                        None => results[*batch_idx] = BatchResult::Single(Err(err)),
-                        Some(ti) => {
-                            if let BatchResult::Transaction(ref mut tx_results) = results[*batch_idx] {
-                                tx_results[*ti] = Err(err);
+                    // Handle conflicts
+                    if *is_batch_append {
+                        // For BatchAppend: any conflict fails the entire batch append
+                        failed_batch_appends.insert(*batch_idx);
+                        results[*batch_idx] = BatchResult::BatchAppend(Err(err));
+                    } else {
+                        // For Single/Transaction: return conflict error for this command
+                        match sub_idx {
+                            None => results[*batch_idx] = BatchResult::Single(Err(err)),
+                            Some(ti) => {
+                                if let BatchResult::Transaction(ref mut tx_results) = results[*batch_idx] {
+                                    tx_results[*ti] = Err(err);
+                                }
                             }
                         }
                     }
@@ -1202,6 +1303,8 @@ impl BatchWriter {
         if valid_commands.is_empty() {
             return Ok(results);
         }
+
+        let t_validate = Instant::now();
 
         // Calculate total events from valid commands
         let total_events: usize = valid_commands.iter().map(|v| v.event_count).sum();
@@ -1224,6 +1327,8 @@ impl BatchWriter {
         };
         let checksum = compute_checksum(&batch_data);
 
+        let t_encode = Instant::now();
+
         // =====================================================================
         // Phase 3: Database operations
         // =====================================================================
@@ -1233,6 +1338,8 @@ impl BatchWriter {
             self.staged.clear(self.next_pos_committed);
             return Err(e.into());
         }
+
+        let t_begin = Instant::now();
 
         // Single INSERT into batches table
         self.conn.prepare_cached(
@@ -1250,6 +1357,8 @@ impl BatchWriter {
         ])?;
 
         let batch_id = self.conn.last_insert_rowid();
+
+        let t_insert_batch = Instant::now();
 
         // Prepare cached statements for event_index, stream_heads, and commands.
         // Using cached prepared statements is faster than dynamic bulk INSERT because:
@@ -1332,8 +1441,33 @@ impl BatchWriter {
         drop(stream_head_stmt);
         drop(cmd_stmt);
 
+        let t_inserts = Instant::now();
+
         // Commit
         let commit_result = self.conn.execute("COMMIT", []);
+
+        let t_commit = Instant::now();
+        let commit_ms = t_commit.duration_since(t_inserts).as_secs_f64() * 1000.0;
+
+        // Print profiling info
+        let batch_size = valid_commands.len();
+        let bytes_written = batch_data.len();
+        let is_slow = commit_ms > 10.0;
+
+        eprintln!(
+            "[rust-writer] batch={} events={} bytes={} validate={:.2}ms encode={:.2}ms begin={:.2}ms insert_batch={:.2}ms inserts={:.2}ms commit={:.2}ms total={:.2}ms{}",
+            batch_size,
+            total_events,
+            bytes_written,
+            t_validate.duration_since(t_start).as_secs_f64() * 1000.0,
+            t_encode.duration_since(t_validate).as_secs_f64() * 1000.0,
+            t_begin.duration_since(t_encode).as_secs_f64() * 1000.0,
+            t_insert_batch.duration_since(t_begin).as_secs_f64() * 1000.0,
+            t_inserts.duration_since(t_insert_batch).as_secs_f64() * 1000.0,
+            commit_ms,
+            t_commit.duration_since(t_start).as_secs_f64() * 1000.0,
+            if is_slow { " SLOW" } else { "" },
+        );
 
         match commit_result {
             Ok(_) => {
@@ -1347,12 +1481,22 @@ impl BatchWriter {
                     );
 
                     // Find the original position in flat_commands
-                    let (_, batch_idx, tx_idx) = flat_commands[validated.flat_index];
-                    match tx_idx {
-                        None => results[batch_idx] = BatchResult::Single(Ok(result)),
-                        Some(ti) => {
-                            if let BatchResult::Transaction(ref mut tx_results) = results[batch_idx] {
-                                tx_results[ti] = Ok(result);
+                    let (_, batch_idx, sub_idx, is_batch_append) = flat_commands[validated.flat_index];
+                    if is_batch_append {
+                        // For BatchAppend: fill in the result at the sub index
+                        if let BatchResult::BatchAppend(Ok(ref mut ba_results)) = results[batch_idx] {
+                            if let Some(idx) = sub_idx {
+                                ba_results[idx] = result;
+                            }
+                        }
+                    } else {
+                        // For Single/Transaction
+                        match sub_idx {
+                            None => results[batch_idx] = BatchResult::Single(Ok(result)),
+                            Some(ti) => {
+                                if let BatchResult::Transaction(ref mut tx_results) = results[batch_idx] {
+                                    tx_results[ti] = Ok(result);
+                                }
                             }
                         }
                     }
@@ -2159,16 +2303,27 @@ impl BatchWriterHandle {
     /// - Records latency for adaptive tuning
     /// - If the deadline is exceeded while waiting, returns `Error::Timeout`
     pub async fn append(&self, command: AppendCommand) -> Result<AppendResult> {
+        let t0 = Instant::now();
         let deadline = Instant::now() + self.admission.default_deadline();
         let event_count = command.events.len();
 
         // Acquire permits with deadline - this is the backpressure point
         let permits = self.admission.acquire_permits(event_count, deadline).await?;
 
+        let t_permit = Instant::now();
+
         // Track latency for adaptive tuning
         let start = Instant::now();
         let result = self.append_inner(command, deadline).await;
         let latency_us = start.elapsed().as_micros() as u64;
+
+        let t_done = Instant::now();
+        eprintln!(
+            "[rust-append] permit={:.2}ms inner={:.2}ms total={:.2}ms",
+            t_permit.duration_since(t0).as_secs_f64() * 1000.0,
+            t_done.duration_since(t_permit).as_secs_f64() * 1000.0,
+            t_done.duration_since(t0).as_secs_f64() * 1000.0,
+        );
 
         // Record latency (only for successful requests to avoid skewing p99)
         if result.is_ok() {
@@ -2190,6 +2345,7 @@ impl BatchWriterHandle {
 
     /// Inner append logic with deadline.
     async fn append_inner(&self, command: AppendCommand, deadline: Instant) -> Result<AppendResult> {
+        let t0 = Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
 
         // Send with remaining deadline
@@ -2202,12 +2358,24 @@ impl BatchWriterHandle {
         .map_err(|_| Error::Timeout("timeout sending to writer".into()))?
         .map_err(|_| Error::Schema("writer has shut down".into()))?;
 
+        let t_send = Instant::now();
+
         // Wait for response with remaining deadline
         let remaining = deadline.saturating_duration_since(Instant::now());
-        timeout(remaining, response_rx)
+        let result = timeout(remaining, response_rx)
             .await
             .map_err(|_| Error::Timeout("timeout waiting for response".into()))?
-            .map_err(|_| Error::Schema("writer dropped response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?;
+
+        let t_recv = Instant::now();
+        eprintln!(
+            "[rust-inner] send={:.2}ms wait={:.2}ms total={:.2}ms",
+            t_send.duration_since(t0).as_secs_f64() * 1000.0,
+            t_recv.duration_since(t_send).as_secs_f64() * 1000.0,
+            t_recv.duration_since(t0).as_secs_f64() * 1000.0,
+        );
+
+        result
     }
 
     /// Returns a snapshot of admission control metrics.
@@ -2331,6 +2499,62 @@ impl BatchWriterHandle {
         let result = timeout(remaining, response_rx)
             .await
             .map_err(|_| Error::Timeout("timeout waiting for atomic transaction response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?;
+
+        // Record latency
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.admission.record_latency(latency_us).await;
+            self.admission.metrics.requests_accepted.fetch_add(1, Ordering::Relaxed);
+        }
+
+        drop(permits);
+        result
+    }
+
+    /// Submits a batch append with all-or-nothing semantics.
+    ///
+    /// All expected revisions are validated upfront. If all pass, events are
+    /// staged and committed together via batch fsync. If any validation fails,
+    /// no events are staged and an error is returned.
+    ///
+    /// This is faster than `submit_atomic_transaction` for multi-stream appends
+    /// without SQL statements, as it uses the batch fsync mechanism rather than
+    /// immediate SQLite transactions.
+    pub async fn submit_batch_append(
+        &self,
+        commands: Vec<AppendCommand>,
+    ) -> Result<Vec<AppendResult>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let deadline = Instant::now() + self.admission.default_deadline();
+
+        // Count total events across all commands
+        let total_events: usize = commands.iter().map(|c| c.events.len()).sum();
+
+        // Acquire permits for all events
+        let permits = self.admission.acquire_permits(total_events, deadline).await?;
+
+        let start = Instant::now();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Send with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, self.tx.send(WriteRequest::BatchAppend {
+            commands,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending batch append to writer".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
+
+        // Wait for response with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = timeout(remaining, response_rx)
+            .await
+            .map_err(|_| Error::Timeout("timeout waiting for batch append response".into()))?
             .map_err(|_| Error::Schema("writer dropped response".into()))?;
 
         // Record latency
@@ -2587,7 +2811,23 @@ pub async fn run_batch_writer(
     let mut batch_bytes: usize = 0;
 
     loop {
-        // Calculate timeout for batch
+        // PROACTIVE TIMEOUT CHECK: Flush batch if timeout exceeded
+        // This ensures batches are bounded even under sustained high load.
+        // Without this check, under high load rx.recv() always returns immediately
+        // (message available), so the timeout never fires and batches grow unbounded.
+        if let Some(start) = batch_start {
+            if start.elapsed() >= config.batch_timeout {
+                let accum_time = start.elapsed();
+                eprintln!("[rust-batch] trigger=timeout_proactive items={} bytes={} accum={:.2}ms",
+                    batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
+                writer.execute_batch(std::mem::take(&mut batch));
+                batch_start = None;
+                batch_bytes = 0;
+                continue; // Restart loop to receive next request
+            }
+        }
+
+        // Calculate timeout for batch (remaining time)
         let wait_timeout = if batch.is_empty() {
             // No pending commands - wait indefinitely
             Duration::from_secs(3600) // 1 hour (effectively forever)
@@ -2613,6 +2853,8 @@ pub async fn run_batch_writer(
 
                 // Check if batch is full (count or bytes threshold)
                 if batch.len() >= config.batch_max_size || batch_bytes >= config.batch_max_bytes {
+                    let accum_time = batch_start.unwrap().elapsed();
+                    eprintln!("[rust-batch] trigger=size items={} bytes={} accum={:.2}ms", batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
                     batch_bytes = 0;
@@ -2635,6 +2877,43 @@ pub async fn run_batch_writer(
 
                 // Check if batch is full (count or bytes threshold)
                 if batch.len() >= config.batch_max_size || batch_bytes >= config.batch_max_bytes {
+                    let accum_time = batch_start.unwrap().elapsed();
+                    eprintln!("[rust-batch] trigger=size items={} bytes={} accum={:.2}ms", batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
+                    writer.execute_batch(std::mem::take(&mut batch));
+                    batch_start = None;
+                    batch_bytes = 0;
+                }
+            }
+            Ok(Some(WriteRequest::BatchAppend { commands, response })) => {
+                // BatchAppend must NOT be split across batches - it's all-or-nothing.
+                // If current batch is at the limit, flush it first to ensure the
+                // entire BatchAppend goes into a fresh batch.
+                if batch.len() >= config.batch_max_size || batch_bytes >= config.batch_max_bytes {
+                    let accum_time = batch_start.unwrap().elapsed();
+                    eprintln!("[rust-batch] trigger=size_pre_ba items={} bytes={} accum={:.2}ms", batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
+                    writer.execute_batch(std::mem::take(&mut batch));
+                    batch_start = None;
+                    batch_bytes = 0;
+                }
+
+                if batch.is_empty() {
+                    batch_start = Some(Instant::now());
+                }
+
+                // Track payload bytes for all commands
+                for cmd in &commands {
+                    batch_bytes += command_payload_bytes(cmd);
+                }
+
+                batch.push(BatchItem::BatchAppend(PendingBatchAppend {
+                    commands,
+                    response,
+                }));
+
+                // Check if batch is full after adding (flush includes the BatchAppend)
+                if batch.len() >= config.batch_max_size || batch_bytes >= config.batch_max_bytes {
+                    let accum_time = batch_start.unwrap().elapsed();
+                    eprintln!("[rust-batch] trigger=size items={} bytes={} accum={:.2}ms", batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
                     batch_bytes = 0;
@@ -2690,6 +2969,8 @@ pub async fn run_batch_writer(
             Err(_) => {
                 // Timeout - execute current batch
                 if !batch.is_empty() {
+                    let accum_time = batch_start.unwrap().elapsed();
+                    eprintln!("[rust-batch] trigger=timeout items={} bytes={} accum={:.2}ms", batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
                     batch_bytes = 0;

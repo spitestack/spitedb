@@ -56,6 +56,24 @@ async function isAggregateFile(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Check if a file is an orchestrator.ts file with an orchestrator class
+ */
+async function isOrchestratorFile(filePath: string): Promise<boolean> {
+  // Only orchestrator.ts files in orchestrator folders
+  if (!filePath.endsWith("/orchestrator.ts") && !filePath.endsWith("\\orchestrator.ts")) {
+    return false;
+  }
+
+  try {
+    const content = await readFile(filePath, "utf-8");
+    // Look for a class ending with "Orchestrator"
+    return /class\s+\w+Orchestrator\b/.test(content);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Recursively walk a directory
  */
 async function walkDir(dir: string): Promise<string[]> {
@@ -80,17 +98,36 @@ async function walkDir(dir: string): Promise<string[]> {
 }
 
 /**
+ * Discovery result containing both aggregates and orchestrators
+ */
+export interface DiscoveryResult {
+  aggregates: DiscoveredFile[];
+  orchestrators: DiscoveredFile[];
+}
+
+/**
  * Discover TypeScript files in the domain directory that might contain aggregates
  */
 export async function discoverFiles(
   config: CompilerConfig
 ): Promise<DiscoveredFile[]> {
+  const result = await discoverAllFiles(config);
+  return result.aggregates;
+}
+
+/**
+ * Discover all domain files including aggregates and orchestrators
+ */
+export async function discoverAllFiles(
+  config: CompilerConfig
+): Promise<DiscoveryResult> {
   const { domainDir, include, exclude } = config;
 
   // Get all TypeScript files in the domain directory
   const allFiles = await walkDir(domainDir);
 
-  const discovered: DiscoveredFile[] = [];
+  const aggregates: DiscoveredFile[] = [];
+  const orchestrators: DiscoveredFile[] = [];
 
   for (const filePath of allFiles) {
     const relativePath = relative(domainDir, filePath);
@@ -105,16 +142,24 @@ export async function discoverFiles(
       continue;
     }
 
-    // Only include aggregate.ts files
-    if (!(await isAggregateFile(filePath))) {
+    // Check if it's an aggregate file
+    if (await isAggregateFile(filePath)) {
+      aggregates.push({
+        path: filePath,
+        relativePath,
+      });
       continue;
     }
 
-    discovered.push({
-      path: filePath,
-      relativePath,
-    });
+    // Check if it's an orchestrator file
+    if (await isOrchestratorFile(filePath)) {
+      orchestrators.push({
+        path: filePath,
+        relativePath,
+      });
+      continue;
+    }
   }
 
-  return discovered;
+  return { aggregates, orchestrators };
 }

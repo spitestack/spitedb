@@ -1,0 +1,14 @@
+{
+  "rps": 7000,
+  "actualRps": 6969.3,
+  "duration": "30s",
+  "p50": 0,
+  "p95": 52.451,
+  "p99": 0,
+  "avgLatency": 36.50354344221196,
+  "totalRequests": 209255,
+  "failedRequests": 495,
+  "errorRate": 0.23655348737186685,
+  "pass": true,
+  "timestamp": "2025-12-20T15:20:03.056Z"
+}

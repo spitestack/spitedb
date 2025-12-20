@@ -161,20 +161,18 @@ async function executeCommand<TInput extends { id: string }>(
     };
   }
 
-  // Persist to SpiteDB
+  // Persist to SpiteDB using optimized JSON path
   // expectedRev: 0 means stream must not exist, -1 means any revision
   const expectedRev = existingEvents.length === 0 ? 0 : existingEvents.length;
-  const eventBuffers = newEvents.map((e) =>
-    Buffer.from(JSON.stringify(wrapEvent(e, ctx.tenant, ctx.actorId)))
-  );
-
-  const result = await ctx.db.append(
-    input.id,
-    ctx.commandId,
+  const payload = JSON.stringify({
+    streamId: input.id,
+    commandId: ctx.commandId,
     expectedRev,
-    eventBuffers,
-    ctx.tenant
-  );
+    events: newEvents.map((e) => wrapEvent(e, ctx.tenant, ctx.actorId)),
+    tenant: ctx.tenant,
+  });
+
+  const result = await ctx.db.appendStreamJson(payload);
 
   return {
     aggregateId: input.id,

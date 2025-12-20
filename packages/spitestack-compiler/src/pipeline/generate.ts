@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join, dirname, relative, extname } from "node:path";
 import type {
   AggregateAnalysis,
+  OrchestratorAnalysis,
   CompilerConfig,
   GenerationResult,
   GeneratedFile,
@@ -11,6 +12,7 @@ import type {
 import { generateValidators } from "../generators/validator";
 import { generateHandlers } from "../generators/handler";
 import { generateWiringFile, generateIndexFile } from "../generators/wiring";
+import { generateOrchestratorHandlers } from "../generators/orchestrator";
 import { generateAuthFile } from "../generators/auth";
 import { generateRoutesFile } from "../generators/routes";
 import {
@@ -271,24 +273,26 @@ export interface GenerateCodeOptions {
 }
 
 /**
- * Generate all code from analyzed aggregates
+ * Generate all code from analyzed aggregates and orchestrators
  */
 export function generateCode(
   aggregates: AggregateAnalysis[],
   config: CompilerConfig,
-  options: GenerateCodeOptions = {}
+  options: GenerateCodeOptions = {},
+  orchestrators: OrchestratorAnalysis[] = []
 ): GenerationResult {
   const registrationResult = applyRegistrations(aggregates, config.registrations);
   const result: GenerationResult = {
     handlers: [],
     validators: [],
+    orchestratorHandlers: [],
     wiring: null,
     index: null,
     auth: null,
     routes: null,
   };
 
-  if (registrationResult.aggregates.length === 0) {
+  if (registrationResult.aggregates.length === 0 && orchestrators.length === 0) {
     return result;
   }
 
@@ -302,12 +306,17 @@ export function generateCode(
     result.handlers = generateHandlers(registrationResult.aggregates, config);
   }
 
+  // Generate orchestrator handlers
+  if (config.generate.handlers && orchestrators.length > 0) {
+    result.orchestratorHandlers = generateOrchestratorHandlers(orchestrators, config);
+  }
+
   // Generate wiring
   if (config.generate.wiring) {
-    result.wiring = generateWiringFile(registrationResult.aggregates, {
+    result.wiring = generateWiringFile(registrationResult.aggregates, orchestrators, {
       allowedCommands: registrationResult.allowedCommands,
     });
-    result.index = generateIndexFile(registrationResult.aggregates, {
+    result.index = generateIndexFile(registrationResult.aggregates, orchestrators, {
       allowedCommands: registrationResult.allowedCommands,
     });
   }
@@ -454,6 +463,7 @@ export async function writeGeneratedFiles(
   const allFiles: GeneratedFile[] = [
     ...result.handlers,
     ...result.validators,
+    ...(result.orchestratorHandlers ?? []),
   ];
 
   if (result.wiring) {
@@ -489,6 +499,7 @@ export interface GenerateResult extends GenerationResult {
  */
 export async function generate(
   aggregates: AggregateAnalysis[],
+  orchestrators: OrchestratorAnalysis[],
   config: CompilerConfig,
   options: GenerateOptions = {}
 ): Promise<GenerateResult> {
@@ -516,7 +527,7 @@ export async function generate(
           latestAlias: config.api.latestAlias,
         }
       : undefined,
-  });
+  }, orchestrators);
 
   await writeGeneratedFiles(result, config.outDir);
 

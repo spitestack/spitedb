@@ -9,7 +9,7 @@ import type {
 
 const DEFAULT_CONFIG: CompilerConfig = {
   mode: "greenfield",
-  domainDir: "./src/domain/aggregates",
+  domainDir: "./src/domain",
   outDir: "./.spitestack/generated",
   include: ["**/*.ts"],
   exclude: ["**/*.test.ts", "**/*.spec.ts"],
@@ -162,7 +162,7 @@ export default App({
   // - "production": Lock files enforced, breaking changes require upcasters
   mode: "greenfield",
 
-  domainDir: "./src/domain/aggregates",
+  domainDir: "./src/domain",
 });
 `;
 }

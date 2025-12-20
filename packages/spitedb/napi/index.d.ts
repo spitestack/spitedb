@@ -14,12 +14,54 @@ export interface AppendResultNapi {
   /** Last stream revision assigned */
   lastRev: number
 }
+/** Append command payload for atomic transactions. */
+export interface AppendCommandNapi {
+  /** The stream to append to */
+  streamId: string
+  /** Unique command ID for idempotency */
+  commandId: string
+  /** Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision */
+  expectedRev: number
+  /** Array of event data buffers */
+  events: Array<Buffer>
+  /** Tenant ID (use DEFAULT_TENANT for single-tenant apps) */
+  tenant: string
+}
+/** Append command payload for batch appends (tenant specified at batch level). */
+export interface BatchAppendCommandNapi {
+  /** The stream to append to */
+  streamId: string
+  /** Unique command ID for idempotency */
+  commandId: string
+  /** Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision */
+  expectedRev: number
+  /** Array of event data buffers */
+  events: Array<Buffer>
+}
+/** SQL parameter for atomic transactions. */
+export interface SqlParamNapi {
+  /** Parameter type: "null", "integer", "real", "text", "blob", "bool" */
+  kind: string
+  /** String value (used for integer/real/text/bool) */
+  value?: string
+  /** Blob value (used for blob) */
+  blob?: Buffer
+}
+/** SQL statement for atomic transactions. */
+export interface SqlStatementNapi {
+  /** SQL statement with ? placeholders */
+  sql: string
+  /** Parameters for the statement */
+  params: Array<SqlParamNapi>
+}
 /** An event read from the store. */
 export interface EventNapi {
   /** Global position in the log */
   globalPos: number
   /** Stream this event belongs to */
   streamId: string
+  /** Tenant hash for this event */
+  tenantHash: number
   /** Revision within the stream */
   streamRev: number
   /** Timestamp when stored (Unix milliseconds) */
@@ -93,6 +135,8 @@ export type SpiteDBNapi = SpiteDbNapi
 export declare class SpiteDbNapi {
   /** Opens a SpiteDB database at the given path. */
   static open(path: string): Promise<SpiteDbNapi>
+  /** Simple test method to verify NAPI exports work */
+  testEcho(msg: string): string
   /**
    * Appends events to a stream.
    *
@@ -103,6 +147,41 @@ export declare class SpiteDbNapi {
    * @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
    */
   append(streamId: string, commandId: string, expectedRev: number, events: Array<Buffer>, tenant: string): Promise<AppendResultNapi>
+  /**
+   * Executes an atomic transaction of appends with optional SQL statements.
+   *
+   * All commands must succeed; any conflict or duplicate aborts the transaction.
+   */
+  atomicTransaction(commands: Array<AppendCommandNapi>, sqlOps: Array<SqlStatementNapi>): Promise<Array<AppendResultNapi>>
+  /**
+   * Appends events to multiple streams atomically via batch fsync.
+   *
+   * All commands must succeed; any conflict or duplicate aborts the entire batch.
+   * This is faster than atomicTransaction for multi-stream appends as it uses
+   * batch fsync rather than immediate SQLite transactions.
+   *
+   * @param commands - Array of append commands, one per stream
+   * @param tenant - Tenant ID (shared by all commands)
+   */
+  appendBatch(commands: Array<BatchAppendCommandNapi>, tenant: string): Promise<Array<AppendResultNapi>>
+  /**
+   * Appends events to a stream using a single JSON payload.
+   *
+   * This is optimized for Bun/Node.js - passing a single JSON string is faster
+   * than passing arrays of Buffers through NAPI due to reduced marshalling overhead.
+   *
+   * @param payload - JSON string containing: { streamId, commandId, expectedRev, events, tenant }
+   */
+  appendStreamJson(payload: string): Promise<AppendResultNapi>
+  /**
+   * Appends events to multiple streams atomically using a single JSON payload.
+   *
+   * This is optimized for Bun/Node.js - passing a single JSON string is faster
+   * than passing arrays of objects through NAPI due to reduced marshalling overhead.
+   *
+   * @param payload - JSON string containing: { commands: [{ streamId, commandId, expectedRev, events }], tenant }
+   */
+  appendBatchJson(payload: string): Promise<Array<AppendResultNapi>>
   /**
    * Reads events from a stream.
    *
@@ -174,5 +253,4 @@ export type {
 
 export { projection, createProjectionProxy, ProjectionRunner } from './js/index';
 
-/** Default tenant ID for single-tenant applications */
-export const DEFAULT_TENANT: string;
+export const SpiteDBNapi: typeof SpiteDbNapi

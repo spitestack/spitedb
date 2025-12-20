@@ -1,4 +1,4 @@
-import type { AggregateAnalysis, GeneratedFile } from "../types";
+import type { AggregateAnalysis, OrchestratorAnalysis, GeneratedFile } from "../types";
 
 /**
  * Helper to capitalize first letter
@@ -12,18 +12,28 @@ function capitalize(str: string): string {
  */
 export function generateWiringFile(
   aggregates: AggregateAnalysis[],
+  orchestrators: OrchestratorAnalysis[] = [],
   options?: {
     allowedCommands?: Map<string, Set<string>>;
   }
 ): GeneratedFile {
   const allowedCommands = options?.allowedCommands;
-  // Generate imports
+  // Generate imports for aggregate handlers
   const handlerImports = aggregates
     .map((agg) => {
       const aggName = agg.aggregateName;
       const handlers = `${aggName}Handlers`;
       const commandType = `${capitalize(aggName)}Command`;
       return `import { ${handlers}, type ${commandType} } from "./handlers/${aggName}.handler";`;
+    })
+    .join("\n");
+
+  // Generate imports for orchestrator handlers
+  const orchestratorImports = orchestrators
+    .map((orch) => {
+      const handlerName = `${orch.orchestratorName}Handler`;
+      const inputType = `${capitalize(orch.orchestratorName)}Input`;
+      return `import { ${handlerName}, type ${inputType} } from "./handlers/${orch.orchestratorName}.orchestrator";`;
     })
     .join("\n");
 
@@ -64,6 +74,18 @@ export function generateWiringFile(
     });
   });
 
+  // Generate orchestrator input types union
+  const orchestratorInputTypes = orchestrators
+    .map((orch) => `${capitalize(orch.orchestratorName)}Input`)
+    .join(" | ") || "never";
+
+  // Generate orchestrator handler switch cases
+  const orchestratorSwitchCases = orchestrators.map((orch) => {
+    const handlerName = `${orch.orchestratorName}Handler`;
+    return `    case "${orch.orchestratorName}":
+      return ${handlerName}(ctx, input as ${capitalize(orch.orchestratorName)}Input);`;
+  });
+
   const content = `/**
  * Auto-generated SpiteDB wiring
  * DO NOT EDIT - regenerate with \`spitestack compile\`
@@ -71,6 +93,7 @@ export function generateWiringFile(
 
 import type { SpiteDbNapi } from "@spitestack/db";
 ${handlerImports}
+${orchestratorImports ? "\n" + orchestratorImports : ""}
 
 /**
  * Union of all command types
@@ -85,6 +108,17 @@ export interface CommandContext {
   commandId: string;
   tenant: string;
   actorId?: string;
+}
+
+/**
+ * Context required for orchestrator execution
+ */
+export interface OrchestratorContext {
+  db: SpiteDbNapi;
+  commandId: string;
+  tenant: string;
+  actorId?: string;
+  adapters: Record<string, unknown>;
 }
 
 /**
@@ -112,8 +146,36 @@ ${switchCases.join("\n\n")}
   }
 }
 
+${orchestrators.length > 0 ? `/**
+ * Union of all orchestrator input types
+ */
+export type OrchestratorInput = ${orchestratorInputTypes};
+
+/**
+ * Available orchestrator names
+ */
+export type OrchestratorName = ${orchestrators.map((o) => `"${o.orchestratorName}"`).join(" | ") || "never"};
+
+/**
+ * Execute an orchestrator
+ */
+export async function executeOrchestrator(
+  ctx: OrchestratorContext,
+  name: OrchestratorName,
+  input: OrchestratorInput
+): Promise<void> {
+  switch (name) {
+${orchestratorSwitchCases.join("\n\n")}
+
+    default:
+      const _exhaustive: never = name;
+      throw new Error(\`Unknown orchestrator: \${name}\`);
+  }
+}
+` : ""}
 // Re-export handlers for direct access
 ${aggregates.map((agg) => `export { ${agg.aggregateName}Handlers } from "./handlers/${agg.aggregateName}.handler";`).join("\n")}
+${orchestrators.length > 0 ? "\n// Re-export orchestrator handlers\n" + orchestrators.map((orch) => `export { ${orch.orchestratorName}Handler } from "./handlers/${orch.orchestratorName}.orchestrator";`).join("\n") : ""}
 `;
 
   return {
@@ -127,6 +189,7 @@ ${aggregates.map((agg) => `export { ${agg.aggregateName}Handlers } from "./handl
  */
 export function generateIndexFile(
   aggregates: AggregateAnalysis[],
+  orchestrators: OrchestratorAnalysis[] = [],
   options?: {
     allowedCommands?: Map<string, Set<string>>;
   }
@@ -138,6 +201,14 @@ export function generateIndexFile(
       const handlers = `${aggName}Handlers`;
       const commandType = `${capitalize(aggName)}Command`;
       return `export { ${handlers}, type ${commandType} } from "./handlers/${aggName}.handler";`;
+    })
+    .join("\n");
+
+  const orchestratorExports = orchestrators
+    .map((orch) => {
+      const handlerName = `${orch.orchestratorName}Handler`;
+      const inputType = `${capitalize(orch.orchestratorName)}Input`;
+      return `export { ${handlerName}, type ${inputType} } from "./handlers/${orch.orchestratorName}.orchestrator";`;
     })
     .join("\n");
 
@@ -157,6 +228,10 @@ export function generateIndexFile(
     .filter(Boolean)
     .join("\n");
 
+  const orchestratorWiringExports = orchestrators.length > 0
+    ? "export { executeOrchestrator, type OrchestratorContext, type OrchestratorName, type OrchestratorInput } from \"./wiring\";"
+    : "";
+
   const content = `/**
  * Auto-generated SpiteStack exports
  * DO NOT EDIT - regenerate with \`spitestack compile\`
@@ -164,9 +239,12 @@ export function generateIndexFile(
 
 // Wiring
 export { executeCommand, type Command, type CommandContext, type CommandResult } from "./wiring";
+${orchestratorWiringExports}
 
 // Handlers
 ${handlerExports}
+
+${orchestratorExports ? "// Orchestrators\n" + orchestratorExports : ""}
 
 // Validators
 ${validatorExports}

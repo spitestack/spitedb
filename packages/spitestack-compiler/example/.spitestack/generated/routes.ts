@@ -4,10 +4,11 @@
  */
 
 import type { SpiteDbNapi } from "@spitestack/db";
-import { DEFAULT_TENANT } from "@spitestack/db";
 import type { Auth } from "better-auth";
 import { executeCommand, type Command } from "./wiring";
 import app from "../../index";
+
+const DEFAULT_TENANT = "default";
 
 type RouteScope = "public" | "auth" | "internal";
 
@@ -38,7 +39,10 @@ const appRoutes: SpiteStackRouteConfig = appConfig?.routes ?? {};
 const COMMAND_ROUTES = new Map<string, RoutePolicy>([
   ["todo.create", { scope: "public" }],
   ["todo.complete", { scope: "public" }],
-  ["todo.rename", { scope: "auth" }]
+  ["todo.rename", { scope: "auth" }],
+  ["project.create", { scope: "auth" }],
+  ["project.addTodo", { scope: "auth" }],
+  ["project.removeTodo", { scope: "auth" }]
 ]);
 
 const DEFAULT_BASE_PATH = "/api";
@@ -72,6 +76,8 @@ export function createCommandHandler(options: RouteOptions) {
   const internalOrgId = options.internalOrgId ?? appAuth.internalOrgId ?? null;
 
   return async function handleRequest(req: Request): Promise<Response> {
+    const t0 = performance.now();
+
     const url = new URL(req.url);
     if (!url.pathname.startsWith(basePath)) {
       return new Response("Not found", { status: 404 });
@@ -119,6 +125,8 @@ export function createCommandHandler(options: RouteOptions) {
       return new Response("Not found", { status: 404 });
     }
 
+    const tRoute = performance.now();
+
     const authResult = await authorizeRequest({
       req,
       policy,
@@ -133,6 +141,8 @@ export function createCommandHandler(options: RouteOptions) {
       return authResult.response;
     }
 
+    const tAuth = performance.now();
+
     let payload: unknown;
     try {
       payload = await req.json();
@@ -143,6 +153,8 @@ export function createCommandHandler(options: RouteOptions) {
     if (!payload || typeof payload !== "object" || !("id" in payload)) {
       return new Response("Missing id in payload", { status: 400 });
     }
+
+    const tParse = performance.now();
 
     const commandId = req.headers.get("x-command-id") ?? randomId("cmd");
     const commandInput = { type: commandType, payload } as Command;
@@ -156,6 +168,10 @@ export function createCommandHandler(options: RouteOptions) {
       },
       commandInput
     );
+
+    const tExec = performance.now();
+
+    console.log(`[profile] route=${(tRoute-t0).toFixed(2)}ms auth=${(tAuth-tRoute).toFixed(2)}ms parse=${(tParse-tAuth).toFixed(2)}ms exec=${(tExec-tParse).toFixed(2)}ms total=${(tExec-t0).toFixed(2)}ms`);
 
     return Response.json(result);
   };

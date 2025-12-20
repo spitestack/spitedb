@@ -2,11 +2,18 @@
   "name": "@spitestack/db",
   "version": "0.1.0",
   "description": "NAPI bindings for SpiteDB - event store with projections",
-  "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    }
+  },
   "files": [
     "index.js",
+    "index.mjs",
     "index.d.ts",
     "js/**/*.js",
     "js/**/*.d.ts"
@@ -25,8 +32,8 @@
   },
   "scripts": {
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release && tsc -p tsconfig.build.json && node scripts/fix-types.js",
-    "build:debug": "napi build --platform && tsc -p tsconfig.build.json && node scripts/fix-types.js",
+    "build": "rm -f *.node && napi build --platform --release && node scripts/copy-dylib.js && tsc -p tsconfig.build.json && node scripts/fix-types.js",
+    "build:debug": "rm -f *.node && napi build --platform && node scripts/copy-dylib.js && tsc -p tsconfig.build.json && node scripts/fix-types.js",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "bun test",
     "typecheck": "tsc --noEmit",

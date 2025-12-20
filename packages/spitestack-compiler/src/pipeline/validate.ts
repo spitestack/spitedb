@@ -1,5 +1,6 @@
 import type {
   AggregateAnalysis,
+  OrchestratorAnalysis,
   Diagnostic,
   ValidationResult,
   TypeInfo,
@@ -159,11 +160,12 @@ function validateUniqueAggregateNames(
 }
 
 /**
- * Validate all analyzed aggregates
+ * Validate all analyzed aggregates and orchestrators
  */
 export function validate(
   aggregates: AggregateAnalysis[],
-  existingDiagnostics: Diagnostic[] = []
+  existingDiagnostics: Diagnostic[] = [],
+  orchestrators: OrchestratorAnalysis[] = []
 ): ValidationResult {
   const diagnostics = [...existingDiagnostics];
 
@@ -191,5 +193,6 @@ export function validate(
     valid: !hasErrors,
     diagnostics,
     aggregates,
+    orchestrators,
   };
 }

@@ -15,11 +15,13 @@ import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { loadConfig, getDefaultAppContent } from "./config";
-import { discoverFiles, parseFiles, analyzeFiles, validate, generate, SchemaEvolutionError, ApiEvolutionError } from "./pipeline";
+import { discoverAllFiles, parseFiles, analyzeFiles, validate, generate, SchemaEvolutionError, ApiEvolutionError, parseOrchestratorFiles, analyzeOrchestrators } from "./pipeline";
 import { DiagnosticReporter } from "./errors/reporter";
 import { DiagnosticCode, DiagnosticMessages } from "./errors/codes";
 import { apiLockExists, bumpApiVersion, getVersionedApiLocks } from "./api/lock";
 import { runDev } from "./dev";
+import { runBuild } from "./build";
+import { runStart } from "./start";
 
 const VERSION = "0.0.1";
 
@@ -32,6 +34,8 @@ Usage:
 Commands:
   compile           Compile aggregates and generate handlers (default)
   dev [entry]       Start dev server with hot reloading
+  build [entry]     Build production binary with native modules
+  start [entry]     Run production server (no hot reload)
   check             Validate without generating code
   init              Create a spitestack.app.ts file
   version api <v>   Bump API version (e.g., "spitestack version api v2")
@@ -46,6 +50,8 @@ Examples:
   spitestack compile          # Compile with App() entrypoint
   spitestack dev              # Start dev server (auto-detects server.ts)
   spitestack dev ./server.ts  # Start dev server with custom entry
+  spitestack build            # Build production binary
+  spitestack start            # Run production server
   spitestack check            # Validate only
   spitestack init             # Create spitestack.app.ts
 `;
@@ -127,10 +133,10 @@ async function runCompile(options: CLIOptions, checkOnly: boolean = false): Prom
 
   console.log(`Discovering files in: ${relative(cwd, config.domainDir)}`);
 
-  // Discover files
-  const files = await discoverFiles(config);
+  // Discover files (both aggregates and orchestrators)
+  const discovered = await discoverAllFiles(config);
 
-  if (files.length === 0) {
+  if (discovered.aggregates.length === 0 && discovered.orchestrators.length === 0) {
     reporter.report({
       code: DiagnosticCode.EMPTY_DOMAIN_DIR,
       severity: "warning",
@@ -145,20 +151,20 @@ async function runCompile(options: CLIOptions, checkOnly: boolean = false): Prom
     return 0;
   }
 
-  console.log(`Found ${files.length} candidate file(s)`);
+  console.log(`Found ${discovered.aggregates.length} aggregate file(s), ${discovered.orchestrators.length} orchestrator file(s)`);
 
-  // Parse files
-  const { program, parsedFiles } = parseFiles(files);
+  // Parse aggregate files
+  const { program, parsedFiles } = parseFiles(discovered.aggregates);
 
-  if (parsedFiles.length === 0) {
-    console.log("No aggregate classes found");
+  if (parsedFiles.length === 0 && discovered.orchestrators.length === 0) {
+    console.log("No aggregate or orchestrator classes found");
     return 0;
   }
 
   // Get type checker
   const typeChecker = program.getTypeChecker();
 
-  // Analyze files
+  // Analyze aggregate files
   const { aggregates, diagnostics: analysisdiagnostics } = analyzeFiles(
     parsedFiles,
     typeChecker,
@@ -166,7 +172,17 @@ async function runCompile(options: CLIOptions, checkOnly: boolean = false): Prom
     config.domainDir
   );
 
-  if (aggregates.length === 0) {
+  // Parse and analyze orchestrator files
+  let orchestrators: import("./types").OrchestratorAnalysis[] = [];
+  if (discovered.orchestrators.length > 0) {
+    const { program: orchProgram, parsedFiles: orchParsedFiles } = parseOrchestratorFiles(discovered.orchestrators);
+    const orchTypeChecker = orchProgram.getTypeChecker();
+    const orchResult = analyzeOrchestrators(orchParsedFiles, orchTypeChecker, orchProgram, config.domainDir, aggregates);
+    orchestrators = orchResult.orchestrators;
+    analysisdiagnostics.push(...orchResult.diagnostics);
+  }
+
+  if (aggregates.length === 0 && orchestrators.length === 0) {
     reporter.report({
       code: DiagnosticCode.NO_AGGREGATES_FOUND,
       severity: "error",
@@ -183,10 +199,15 @@ async function runCompile(options: CLIOptions, checkOnly: boolean = false): Prom
     return 1;
   }
 
-  console.log(`Found ${aggregates.length} aggregate(s): ${aggregates.map((a) => a.className).join(", ")}`);
+  if (aggregates.length > 0) {
+    console.log(`Found ${aggregates.length} aggregate(s): ${aggregates.map((a) => a.className).join(", ")}`);
+  }
+  if (orchestrators.length > 0) {
+    console.log(`Found ${orchestrators.length} orchestrator(s): ${orchestrators.map((o) => o.className).join(", ")}`);
+  }
 
   // Validate
-  const validation = validate(aggregates, analysisdiagnostics);
+  const validation = validate(aggregates, analysisdiagnostics, orchestrators);
 
   // Report diagnostics
   reporter.reportAll(validation.diagnostics);
@@ -207,7 +228,7 @@ async function runCompile(options: CLIOptions, checkOnly: boolean = false): Prom
   console.log(`Mode: ${config.mode}`);
 
   try {
-    const result = await generate(aggregates, config, { force: options.force });
+    const result = await generate(aggregates, orchestrators, config, { force: options.force });
 
     // Report schema lock status
     if (result.schemaLock.created) {
@@ -367,6 +388,14 @@ async function main(): Promise<void> {
 
     case "dev":
       exitCode = await runDev(args, options, runCompile);
+      break;
+
+    case "build":
+      exitCode = await runBuild(args, options, runCompile);
+      break;
+
+    case "start":
+      exitCode = await runStart(args, options);
       break;
 
     case "check":

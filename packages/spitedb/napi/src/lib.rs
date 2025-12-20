@@ -9,12 +9,41 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::Mutex;
 
+use serde::Deserialize;
 use spitedb::{
     AppendCommand, AppendResult, CommandId, Event, EventData, GlobalPos, MetricsSnapshot, SpiteDB,
     SqlStatement, SqlValue, StreamId, StreamRev, Tenant,
 };
 
 mod projection;
+
+// JSON request structs for appendStreamJson
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendStreamRequest {
+    stream_id: String,
+    command_id: String,
+    expected_rev: i64,
+    events: Vec<serde_json::Value>,
+    tenant: String,
+}
+
+// JSON request structs for appendBatchJson
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchCommand {
+    stream_id: String,
+    command_id: String,
+    expected_rev: i64,
+    events: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchAppendRequest {
+    commands: Vec<BatchCommand>,
+    tenant: String,
+}
 
 pub use projection::{
     BatchResult, ColumnDef, ColumnType, OpType, ProjectionError, ProjectionOp,
@@ -45,6 +74,12 @@ impl SpiteDBNapi {
             inner: Arc::new(db),
             projection_registry: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Simple test method to verify NAPI exports work
+    #[napi]
+    pub fn test_echo(&self, msg: String) -> String {
+        format!("Echo: {}", msg)
     }
 
     /// Appends events to a stream.
@@ -106,7 +141,7 @@ impl SpiteDBNapi {
     /// Executes an atomic transaction of appends with optional SQL statements.
     ///
     /// All commands must succeed; any conflict or duplicate aborts the transaction.
-    #[napi(js_name = "atomicTransaction")]
+    #[napi]
     pub async fn atomic_transaction(
         &self,
         commands: Vec<AppendCommandNapi>,
@@ -136,6 +171,168 @@ impl SpiteDBNapi {
             .submit()
             .await
             .map_err(|e| Error::from_reason(format!("Atomic transaction failed: {}", e)))?;
+
+        Ok(results.into_iter().map(AppendResultNapi::from).collect())
+    }
+
+    /// Appends events to multiple streams atomically via batch fsync.
+    ///
+    /// All commands must succeed; any conflict or duplicate aborts the entire batch.
+    /// This is faster than atomicTransaction for multi-stream appends as it uses
+    /// batch fsync rather than immediate SQLite transactions.
+    ///
+    /// @param commands - Array of append commands, one per stream
+    /// @param tenant - Tenant ID (shared by all commands)
+    #[napi]
+    pub async fn append_batch(
+        &self,
+        commands: Vec<BatchAppendCommandNapi>,
+        tenant: String,
+    ) -> Result<Vec<AppendResultNapi>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tenant_obj = Tenant::new(tenant);
+
+        let append_commands: Vec<AppendCommand> = commands
+            .into_iter()
+            .filter(|cmd| !cmd.events.is_empty())
+            .map(|cmd| {
+                let expected = if cmd.expected_rev < 0 {
+                    StreamRev::ANY
+                } else {
+                    StreamRev::from_raw(cmd.expected_rev as u64)
+                };
+
+                let event_data: Vec<EventData> = cmd
+                    .events
+                    .into_iter()
+                    .map(|buf| EventData::new(buf.to_vec()))
+                    .collect();
+
+                AppendCommand::new_with_tenant(
+                    CommandId::new(cmd.command_id),
+                    StreamId::new(cmd.stream_id),
+                    tenant_obj.clone(),
+                    expected,
+                    event_data,
+                )
+            })
+            .collect();
+
+        if append_commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let results = self.inner
+            .batch_append(append_commands)
+            .await
+            .map_err(|e| Error::from_reason(format!("Batch append failed: {}", e)))?;
+
+        Ok(results.into_iter().map(AppendResultNapi::from).collect())
+    }
+
+    /// Appends events to a stream using a single JSON payload.
+    ///
+    /// This is optimized for Bun/Node.js - passing a single JSON string is faster
+    /// than passing arrays of Buffers through NAPI due to reduced marshalling overhead.
+    ///
+    /// @param payload - JSON string containing: { streamId, commandId, expectedRev, events, tenant }
+    #[napi]
+    pub async fn append_stream_json(&self, payload: String) -> Result<AppendResultNapi> {
+        let req: AppendStreamRequest = serde_json::from_str(&payload)
+            .map_err(|e| Error::from_reason(format!("Invalid JSON: {}", e)))?;
+
+        if req.events.is_empty() {
+            return Err(Error::from_reason("events array cannot be empty"));
+        }
+
+        let expected = if req.expected_rev < 0 {
+            StreamRev::ANY
+        } else {
+            StreamRev::from_raw(req.expected_rev as u64)
+        };
+
+        // Convert JSON values to event buffers
+        let event_data: Vec<EventData> = req
+            .events
+            .into_iter()
+            .map(|v| EventData::new(serde_json::to_vec(&v).unwrap_or_default()))
+            .collect();
+
+        let tenant_obj = Tenant::new(req.tenant);
+
+        let command = AppendCommand::new_with_tenant(
+            CommandId::new(req.command_id),
+            StreamId::new(req.stream_id),
+            tenant_obj,
+            expected,
+            event_data,
+        );
+
+        let result = self
+            .inner
+            .append(command)
+            .await
+            .map_err(|e| Error::from_reason(format!("Append failed: {}", e)))?;
+
+        Ok(AppendResultNapi::from(result))
+    }
+
+    /// Appends events to multiple streams atomically using a single JSON payload.
+    ///
+    /// This is optimized for Bun/Node.js - passing a single JSON string is faster
+    /// than passing arrays of objects through NAPI due to reduced marshalling overhead.
+    ///
+    /// @param payload - JSON string containing: { commands: [{ streamId, commandId, expectedRev, events }], tenant }
+    #[napi]
+    pub async fn append_batch_json(&self, payload: String) -> Result<Vec<AppendResultNapi>> {
+        let req: BatchAppendRequest = serde_json::from_str(&payload)
+            .map_err(|e| Error::from_reason(format!("Invalid JSON: {}", e)))?;
+
+        if req.commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tenant_obj = Tenant::new(req.tenant);
+
+        let append_commands: Vec<AppendCommand> = req
+            .commands
+            .into_iter()
+            .filter(|cmd| !cmd.events.is_empty())
+            .map(|cmd| {
+                let expected = if cmd.expected_rev < 0 {
+                    StreamRev::ANY
+                } else {
+                    StreamRev::from_raw(cmd.expected_rev as u64)
+                };
+
+                let event_data: Vec<EventData> = cmd
+                    .events
+                    .into_iter()
+                    .map(|v| EventData::new(serde_json::to_vec(&v).unwrap_or_default()))
+                    .collect();
+
+                AppendCommand::new_with_tenant(
+                    CommandId::new(cmd.command_id),
+                    StreamId::new(cmd.stream_id),
+                    tenant_obj.clone(),
+                    expected,
+                    event_data,
+                )
+            })
+            .collect();
+
+        if append_commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let results = self
+            .inner
+            .batch_append(append_commands)
+            .await
+            .map_err(|e| Error::from_reason(format!("Batch append failed: {}", e)))?;
 
         Ok(results.into_iter().map(AppendResultNapi::from).collect())
     }
@@ -369,6 +566,19 @@ pub struct AppendCommandNapi {
     pub events: Vec<Buffer>,
     /// Tenant ID (use DEFAULT_TENANT for single-tenant apps)
     pub tenant: String,
+}
+
+/// Append command payload for batch appends (tenant specified at batch level).
+#[napi(object)]
+pub struct BatchAppendCommandNapi {
+    /// The stream to append to
+    pub stream_id: String,
+    /// Unique command ID for idempotency
+    pub command_id: String,
+    /// Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision
+    pub expected_rev: i64,
+    /// Array of event data buffers
+    pub events: Vec<Buffer>,
 }
 
 /// SQL parameter for atomic transactions.
