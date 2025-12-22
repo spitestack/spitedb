@@ -10,6 +10,13 @@ dist/
 packages/spitestack-cli/npm/**/spitestack
 packages/spitestack-cli/npm/**/spitestack.exe
 
+# Local data / databases
+*.db
+*.db-shm
+*.db-wal
+packages/spitestack-compiler/example/data/
+packages/spitestack-compiler/example/profile.log
+
 # IDE
 .idea/
 .vscode/
