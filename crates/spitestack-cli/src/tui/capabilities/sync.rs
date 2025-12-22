@@ -42,9 +42,9 @@ pub fn end_sync_update<W: Write>(writer: &mut W) -> io::Result<()> {
 /// ```ignore
 /// let mut stdout = io::stdout();
 /// {
-///     let _sync = SyncGuard::new(&mut stdout, true)?;
+///     let mut sync = SyncGuard::new(&mut stdout, true)?;
 ///     // All rendering here is batched
-///     write!(stdout, "...")?;
+///     write!(sync, "...")?;
 /// } // Sync ends here, frame is rendered atomically
 /// ```
 pub struct SyncGuard<'a, W: Write> {
@@ -69,6 +69,16 @@ impl<'a, W: Write> SyncGuard<'a, W> {
     }
 }
 
+impl<W: Write> Write for SyncGuard<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 impl<W: Write> Drop for SyncGuard<'_, W> {
     fn drop(&mut self) {
         if self.enabled {
@@ -83,17 +93,19 @@ impl<W: Write> Drop for SyncGuard<'_, W> {
 /// # Example
 ///
 /// ```ignore
-/// with_sync(&mut stdout, supports_sync, || {
+/// with_sync(&mut stdout, supports_sync, |out| {
 ///     // Render frame here
+///     writeln!(out, "frame")?;
+///     Ok(())
 /// })?;
 /// ```
 pub fn with_sync<W, F, R>(writer: &mut W, enabled: bool, f: F) -> io::Result<R>
 where
     W: Write,
-    F: FnOnce() -> R,
+    F: FnOnce(&mut W) -> io::Result<R>,
 {
-    let _guard = SyncGuard::new(writer, enabled)?;
-    Ok(f())
+    let guard = SyncGuard::new(writer, enabled)?;
+    f(&mut *guard.writer)
 }
 
 #[cfg(test)]
@@ -118,9 +130,9 @@ mod tests {
 
         {
             let _guard = SyncGuard::new(&mut buf, true).unwrap();
-            assert!(buf.starts_with(b"\x1b[?2026h"));
         }
-        // Guard dropped, should have end sequence
+        // Guard dropped, should have both sequences
+        assert!(buf.starts_with(b"\x1b[?2026h"));
         assert!(buf.ends_with(b"\x1b[?2026l"));
     }
 
