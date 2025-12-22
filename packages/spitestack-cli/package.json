@@ -5,6 +5,10 @@
   "bin": {
     "spitestack": "bin/spitestack.js"
   },
+  "files": [
+    "bin/",
+    "scripts/"
+  ],
   "scripts": {
     "postinstall": "node scripts/postinstall.js"
   },
@@ -27,6 +31,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/spitestack/spitedb.git"
+    "url": "https://github.com/spitestack/spitestack.git"
   }
 }

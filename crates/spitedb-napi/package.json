@@ -51,7 +51,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/spitedb/spitedb"
+    "url": "https://github.com/spitestack/spitestack.git"
   },
   "license": "MIT",
   "keywords": [
