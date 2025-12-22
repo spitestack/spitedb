@@ -247,7 +247,7 @@ impl Compiler {
             path: src_dir.clone(),
             message: e.to_string(),
         })?;
-        let index_ts = project::generate_index_ts(port);
+        let index_ts = project::generate_index_ts(port, project_name);
         std::fs::write(src_dir.join("index.ts"), index_ts).map_err(|e| CompilerError::IoError {
             path: src_dir.join("index.ts"),
             message: e.to_string(),

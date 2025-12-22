@@ -274,3 +274,91 @@ export type {
 export { projection, createProjectionProxy, ProjectionRunner } from './js/index';
 
 export const SpiteDBNapi: typeof SpiteDbNapi
+
+export type TelemetryKindNapi = 'Log' | 'Metric' | 'Span'
+export type MetricKindNapi = 'Gauge' | 'Counter' | 'Histogram' | 'Summary'
+export type SpanStatusNapi = 'Unset' | 'Ok' | 'Error'
+export type TelemetryOrderNapi = 'Asc' | 'Desc'
+export type TimeSliceNapi = 'Daily'
+
+export interface TelemetryConfigNapi {
+  appName?: string
+  partitions?: number
+  batchMaxMs?: number
+  batchMaxBytes?: number
+  batchMaxRecords?: number
+  maxInflight?: number
+  retentionDays?: number
+  timeSlice?: TimeSliceNapi
+  defaultService?: string
+}
+
+export interface TelemetryCursorNapi {
+  slice: string
+  lastIds: Array<number>
+}
+
+export interface TelemetryRecordNapi {
+  tsMs: number
+  kind: TelemetryKindNapi
+  tenantId?: string
+  tenantHash?: number
+  eventGlobalPos?: number
+  streamId?: string
+  streamHash?: number
+  streamRev?: number
+  commandId?: string
+  traceId?: string
+  spanId?: string
+  parentSpanId?: string
+  name?: string
+  service?: string
+  severity?: number
+  message?: string
+  metricName?: string
+  metricValue?: number
+  metricKind?: MetricKindNapi
+  metricUnit?: string
+  spanStartMs?: number
+  spanEndMs?: number
+  spanDurationMs?: number
+  spanStatus?: SpanStatusNapi
+  attrsJson?: string
+}
+
+export interface TelemetryQueryNapi {
+  tenantId?: string
+  tenantHash?: number
+  kind?: TelemetryKindNapi
+  startMs?: number
+  endMs?: number
+  severity?: number
+  metricName?: string
+  eventGlobalPos?: number
+  streamId?: string
+  streamHash?: number
+  streamRev?: number
+  commandId?: string
+  traceId?: string
+  limit?: number
+  order?: TelemetryOrderNapi
+  slice?: string
+  shardId?: number
+}
+
+export interface TelemetryTailResultNapi {
+  records: Array<TelemetryRecordNapi>
+  cursor: TelemetryCursorNapi
+}
+
+export declare class TelemetryDbNapi {
+  static open(root: string, config?: TelemetryConfigNapi): Promise<TelemetryDbNapi>
+  write(record: TelemetryRecordNapi): Promise<void>
+  writeBatch(records: Array<TelemetryRecordNapi>): Promise<void>
+  flush(): Promise<void>
+  query(query: TelemetryQueryNapi): Promise<Array<TelemetryRecordNapi>>
+  tail(cursor: TelemetryCursorNapi, limit: number): Promise<TelemetryTailResultNapi>
+  cleanupRetention(): Promise<void>
+}
+
+export const TelemetryDBNapi: typeof TelemetryDbNapi

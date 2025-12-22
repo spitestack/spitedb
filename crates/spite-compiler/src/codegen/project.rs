@@ -81,17 +81,22 @@ pub fn generate_tsconfig() -> &'static str {
 }
 
 /// Generates src/index.ts entry point.
-pub fn generate_index_ts(port: u16) -> String {
+pub fn generate_index_ts(port: u16, app_name: &str) -> String {
     format!(
-        r#"import {{ SpiteDbNapi }} from '@spitestack/db';
+        r#"import {{ SpiteDbNapi, TelemetryDbNapi }} from '@spitestack/db';
 import {{ mkdir }} from 'node:fs/promises';
 import {{ createRouter }} from './generated/router';
 
-// Ensure data directory exists
-await mkdir('./data', {{ recursive: true }});
+const eventsDir = './data/events';
+const telemetryDir = './data/telemetry';
 
-const db = await SpiteDbNapi.open('./data/events.db');
-const router = createRouter({{ db, tenant: 'default' }});
+// Ensure data directories exist
+await mkdir(eventsDir, {{ recursive: true }});
+await mkdir(telemetryDir, {{ recursive: true }});
+
+const db = await SpiteDbNapi.open(`${{eventsDir}}/{}.db`);
+const telemetry = await TelemetryDbNapi.open(telemetryDir, {{ appName: '{}' }});
+const router = createRouter({{ db, telemetry, tenant: 'default' }});
 
 const server = Bun.serve({{
   port: {},
@@ -99,8 +104,31 @@ const server = Bun.serve({{
 }});
 
 console.log(`🚀 SpiteStack server running at http://localhost:${{server.port}}`);
+
+// Best-effort startup telemetry
+void telemetry.writeBatch([{{
+  tsMs: Date.now(),
+  kind: 'Log',
+  tenantId: 'default',
+  severity: 1,
+  message: 'server.start',
+  attrsJson: JSON.stringify({{
+    port: server.port,
+    env: process.env.NODE_ENV ?? 'dev',
+  }}),
+}}]).catch(() => {{}});
+
+process.on('SIGINT', () => {{
+  void telemetry.writeBatch([{{
+    tsMs: Date.now(),
+    kind: 'Log',
+    tenantId: 'default',
+    severity: 1,
+    message: 'server.stop',
+  }}]).finally(() => process.exit(0));
+}});
 "#,
-        port
+        app_name, app_name, port
     )
 }
 

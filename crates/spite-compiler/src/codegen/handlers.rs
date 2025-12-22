@@ -16,9 +16,10 @@ pub fn generate_handlers(aggregate: &AggregateIR, domain_import_path: &str) -> S
 
     // Imports
     code.push_str(&format!(
-        r#"import type {{ SpiteDbNapi }} from '@spitestack/db';
+        r#"import type {{ SpiteDbNapi, TelemetryDbNapi }} from '@spitestack/db';
 import {{ {name}Aggregate }} from '{domain_import_path}/{name}/aggregate';
 import type {{ {name}Event }} from '{domain_import_path}/{name}/events';
+import {{ emitTelemetry, finishSpan, logError, logWarn, metricCounter, metricHistogram, startSpan }} from '../runtime/telemetry';
 "#
     ));
 
@@ -41,6 +42,7 @@ import type {{ {name}Event }} from '{domain_import_path}/{name}/events';
         r#"
 export type HandlerContext = {
   db: SpiteDbNapi;
+  telemetry: TelemetryDbNapi;
   tenant: string;
 };
 "#,
@@ -64,21 +66,67 @@ fn generate_get_handler(aggregate: &AggregateIR) -> String {
         r#"
 export async function handle{name}Get(
   ctx: HandlerContext,
-  streamId: string
+  streamId: string,
+  traceId?: string,
+  parentSpanId?: string
 ): Promise<Response> {{
-  const storedEvents = await ctx.db.readStream(streamId, 0, 10000, ctx.tenant);
-  const aggregate = new {name}Aggregate();
-  for (const e of storedEvents) {{
-    aggregate.apply(JSON.parse(e.data.toString()) as {name}Event);
-  }}
-
-  return new Response(JSON.stringify({{
+  const resolvedTraceId = traceId ?? crypto.randomUUID();
+  const span = startSpan(ctx.tenant, resolvedTraceId, 'query.{name}.get', parentSpanId, {{
     streamId,
-    state: aggregate.currentState,
-  }}), {{
-    status: 200,
-    headers: {{ 'Content-Type': 'application/json' }},
   }});
+  const startMs = Date.now();
+  const records = [];
+
+  const finalize = (response: Response, status: 'Ok' | 'Error', err?: unknown) => {{
+    const endMs = Date.now();
+    records.push(
+      finishSpan(span, status, endMs, {{
+        status: response.status,
+        duration_ms: Math.max(0, endMs - startMs),
+      }})
+    );
+    records.push(
+      metricCounter(ctx.tenant, 'query.invocations', 1, {{
+        aggregate: '{name}',
+        status: response.status,
+      }}, resolvedTraceId, span.spanId)
+    );
+    records.push(
+      metricHistogram(ctx.tenant, 'query.duration_ms', Math.max(0, endMs - startMs), {{
+        aggregate: '{name}',
+        status: response.status,
+      }}, resolvedTraceId, span.spanId)
+    );
+    if (err || response.status >= 500) {{
+      const message = err instanceof Error ? err.message : 'query failed';
+      records.push(logError(ctx.tenant, message, {{ aggregate: '{name}', streamId }}, resolvedTraceId, span.spanId));
+    }}
+    emitTelemetry(ctx.telemetry, records);
+    return response;
+  }};
+
+  try {{
+    const storedEvents = await ctx.db.readStream(streamId, 0, 10000, ctx.tenant);
+    const aggregate = new {name}Aggregate();
+    for (const e of storedEvents) {{
+      aggregate.apply(JSON.parse(e.data.toString()) as {name}Event);
+    }}
+
+    const response = new Response(JSON.stringify({{
+      streamId,
+      state: aggregate.currentState,
+    }}), {{
+      status: 200,
+      headers: {{ 'Content-Type': 'application/json' }},
+    }});
+    return finalize(response, 'Ok');
+  }} catch (err) {{
+    const response = new Response(JSON.stringify({{ error: (err as Error).message }}), {{
+      status: 500,
+      headers: {{ 'Content-Type': 'application/json' }},
+    }});
+    return finalize(response, 'Error', err);
+  }}
 }}
 "#
     )
@@ -106,48 +154,124 @@ fn generate_command_handler(aggregate: &AggregateIR, cmd: &CommandIR) -> String 
 export async function handle{name}{cmd_pascal}(
   ctx: HandlerContext,
   streamId: string,
-  body: unknown
+  body: unknown,
+  traceId?: string,
+  parentSpanId?: string
 ): Promise<Response> {{
+  const resolvedTraceId = traceId ?? crypto.randomUUID();
+  const span = startSpan(ctx.tenant, resolvedTraceId, 'command.{name}.{cmd_pascal}', parentSpanId, {{
+    streamId,
+    command: '{cmd_pascal}',
+  }});
+  const startMs = Date.now();
+  const records = [];
+  const finalize = (response: Response, status: 'Ok' | 'Error', err?: unknown) => {{
+    const endMs = Date.now();
+    records.push(
+      finishSpan(span, status, endMs, {{
+        status: response.status,
+        duration_ms: Math.max(0, endMs - startMs),
+      }})
+    );
+    records.push(
+      metricCounter(ctx.tenant, 'command.invocations', 1, {{
+        aggregate: '{name}',
+        command: '{cmd_pascal}',
+        status: response.status,
+      }}, resolvedTraceId, span.spanId, span.commandId)
+    );
+    records.push(
+      metricHistogram(ctx.tenant, 'command.duration_ms', Math.max(0, endMs - startMs), {{
+        aggregate: '{name}',
+        command: '{cmd_pascal}',
+        status: response.status,
+      }}, resolvedTraceId, span.spanId, span.commandId)
+    );
+    if (err || response.status >= 500) {{
+      const message = err instanceof Error ? err.message : 'command failed';
+      records.push(logError(ctx.tenant, message, {{ aggregate: '{name}', command: '{cmd_pascal}', streamId }}, resolvedTraceId, span.spanId, span.commandId));
+    }}
+    emitTelemetry(ctx.telemetry, records);
+    return response;
+  }};
+
   const validation = validate{name}{cmd_pascal}Input(body);
   if (!validation.ok) {{
-    return new Response(JSON.stringify({{ errors: validation.errors }}), {{
+    const response = new Response(JSON.stringify({{ errors: validation.errors }}), {{
       status: 400,
       headers: {{ 'Content-Type': 'application/json' }},
     }});
+    records.push(logWarn(ctx.tenant, 'validation failed', {{ aggregate: '{name}', command: '{cmd_pascal}' }}, resolvedTraceId, span.spanId));
+    return finalize(response, 'Error');
   }}
   const input = validation.value;
 
-  const storedEvents = await ctx.db.readStream(streamId, 0, 10000, ctx.tenant);
-  const aggregate = new {name}Aggregate();
-  for (const e of storedEvents) {{
-    aggregate.apply(JSON.parse(e.data.toString()) as {name}Event);
-  }}
-  const currentRev = storedEvents.length > 0 ? storedEvents[storedEvents.length - 1].streamRev : 0;
-
   try {{
-    {command_call}
-  }} catch (err) {{
-    return new Response(JSON.stringify({{ error: (err as Error).message }}), {{
-      status: 400,
+    const storedEvents = await ctx.db.readStream(streamId, 0, 10000, ctx.tenant);
+    const aggregate = new {name}Aggregate();
+    for (const e of storedEvents) {{
+      aggregate.apply(JSON.parse(e.data.toString()) as {name}Event);
+    }}
+    const currentRev = storedEvents.length > 0 ? storedEvents[storedEvents.length - 1].streamRev : 0;
+
+    try {{
+      {command_call}
+    }} catch (err) {{
+      const response = new Response(JSON.stringify({{ error: (err as Error).message }}), {{
+        status: 400,
+        headers: {{ 'Content-Type': 'application/json' }},
+      }});
+      records.push(logWarn(ctx.tenant, 'command rejected', {{ aggregate: '{name}', command: '{cmd_pascal}' }}, resolvedTraceId, span.spanId));
+      return finalize(response, 'Error', err);
+    }}
+
+    const newEvents = aggregate.events;
+    if (newEvents.length > 0) {{
+      const eventBuffers = newEvents.map(e => Buffer.from(JSON.stringify(e)));
+      const commandId = crypto.randomUUID();
+      span.commandId = commandId;
+      const payloadBytes = eventBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+      try {{
+        await ctx.db.append(streamId, commandId, currentRev, eventBuffers, ctx.tenant);
+        records.push(
+          metricCounter(ctx.tenant, 'events.appended', newEvents.length, {{
+            aggregate: '{name}',
+            command: '{cmd_pascal}',
+            streamId,
+          }}, resolvedTraceId, span.spanId, commandId)
+        );
+        records.push(
+          metricHistogram(ctx.tenant, 'events.payload_bytes', payloadBytes, {{
+            aggregate: '{name}',
+            command: '{cmd_pascal}',
+            streamId,
+          }}, resolvedTraceId, span.spanId, commandId)
+        );
+      }} catch (err) {{
+        const response = new Response(JSON.stringify({{ error: (err as Error).message }}), {{
+          status: 500,
+          headers: {{ 'Content-Type': 'application/json' }},
+        }});
+        return finalize(response, 'Error', err);
+      }}
+    }}
+
+    const response = new Response(JSON.stringify({{
+      streamId,
+      events: newEvents,
+      state: aggregate.currentState,
+    }}), {{
+      status: 200,
       headers: {{ 'Content-Type': 'application/json' }},
     }});
+    return finalize(response, 'Ok');
+  }} catch (err) {{
+    const response = new Response(JSON.stringify({{ error: (err as Error).message }}), {{
+      status: 500,
+      headers: {{ 'Content-Type': 'application/json' }},
+    }});
+    return finalize(response, 'Error', err);
   }}
-
-  const newEvents = aggregate.events;
-  if (newEvents.length > 0) {{
-    const eventBuffers = newEvents.map(e => Buffer.from(JSON.stringify(e)));
-    const commandId = crypto.randomUUID();
-    await ctx.db.append(streamId, commandId, currentRev, eventBuffers, ctx.tenant);
-  }}
-
-  return new Response(JSON.stringify({{
-    streamId,
-    events: newEvents,
-    state: aggregate.currentState,
-  }}), {{
-    status: 200,
-    headers: {{ 'Content-Type': 'application/json' }},
-  }});
 }}
 "#
     )
@@ -192,7 +316,7 @@ mod tests {
         let agg = make_test_aggregate("Todo", vec![]);
         let code = generate_handlers(&agg, "../../domain");
 
-        assert!(code.contains("import type { SpiteDbNapi } from '@spitestack/db'"));
+        assert!(code.contains("import type { SpiteDbNapi, TelemetryDbNapi } from '@spitestack/db'"));
         assert!(code.contains("import { TodoAggregate } from '../../domain/Todo/aggregate'"));
         assert!(code.contains("import type { TodoEvent } from '../../domain/Todo/events'"));
     }
@@ -204,6 +328,7 @@ mod tests {
 
         assert!(code.contains("export type HandlerContext = {"));
         assert!(code.contains("db: SpiteDbNapi;"));
+        assert!(code.contains("telemetry: TelemetryDbNapi;"));
         assert!(code.contains("tenant: string;"));
     }
 
@@ -261,5 +386,19 @@ mod tests {
 
         assert!(code.contains("import { validateTodoCreateInput, validateTodoCompleteInput }"));
         assert!(code.contains("from '../validators/todo.validator'"));
+    }
+
+    #[test]
+    fn emits_telemetry_without_flush() {
+        let agg = make_test_aggregate(
+            "Todo",
+            vec![make_test_command("create", vec![("id", DomainType::String)])],
+        );
+        let code = generate_handlers(&agg, "../../domain");
+
+        assert!(code.contains("emitTelemetry(ctx.telemetry, records);"));
+        assert!(code.contains("const finalize = (response: Response, status: 'Ok' | 'Error', err?: unknown) => {"));
+        assert!(!code.contains("flushTelemetry"));
+        assert!(!code.contains("const finalize = async"));
     }
 }

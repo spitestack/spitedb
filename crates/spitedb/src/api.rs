@@ -81,6 +81,7 @@ use crate::crypto::BatchCryptor;
 use crate::error::{Error, Result};
 use crate::reader::{self, ReadRequest};
 use crate::schema::Database;
+use crate::telemetry::{TelemetryConfig, TelemetryDB};
 use crate::types::{
     AppendCommand, AppendResult, CommandId, DeleteStreamCommand, DeleteStreamResult,
     DeleteTenantCommand, DeleteTenantResult, Event, GlobalPos, StreamId, StreamRev, Tenant,
@@ -212,6 +213,23 @@ impl SpiteDB {
         Self::open_internal(path, cryptor).await
     }
 
+    /// Opens a SpiteDB event store and a telemetry store together.
+    ///
+    /// # Arguments
+    ///
+    /// * `events_path` - Path to the SQLite event store.
+    /// * `telemetry_root` - Root directory for telemetry shards.
+    /// * `telemetry_config` - Telemetry configuration (includes app name).
+    pub async fn open_with_telemetry<P: AsRef<Path>, T: AsRef<Path>>(
+        events_path: P,
+        telemetry_root: T,
+        telemetry_config: TelemetryConfig,
+    ) -> Result<(Self, TelemetryDB)> {
+        let events = Self::open(events_path).await?;
+        let telemetry = TelemetryDB::open(telemetry_root, telemetry_config)?;
+        Ok((events, telemetry))
+    }
+
     /// Opens a file-based database with a custom cryptor.
     ///
     /// # Use Case
@@ -242,9 +260,9 @@ impl SpiteDB {
             .unwrap_or(MIN_READ_THREADS)
             .clamp(MIN_READ_THREADS, MAX_READ_THREADS);
 
-        // Wrap the receiver in Arc<std::sync::Mutex> for sharing across threads
+        // Wrap the receiver in Arc<tokio::sync::Mutex> for sharing across threads
         // Threads compete to receive from the channel (simple load balancing)
-        let read_rx = Arc::new(std::sync::Mutex::new(read_rx));
+        let read_rx = Arc::new(Mutex::new(read_rx));
 
         // Spawn reader thread pool
         // Each thread opens its own read-only connection.

@@ -35,12 +35,106 @@ export type {
 export { projection, createProjectionProxy, ProjectionRunner } from './js/index';
 `;
 
+const telemetryTypes = `
+export type TelemetryKindNapi = 'Log' | 'Metric' | 'Span'
+export type MetricKindNapi = 'Gauge' | 'Counter' | 'Histogram' | 'Summary'
+export type SpanStatusNapi = 'Unset' | 'Ok' | 'Error'
+export type TelemetryOrderNapi = 'Asc' | 'Desc'
+export type TimeSliceNapi = 'Daily'
+
+export interface TelemetryConfigNapi {
+  appName?: string
+  partitions?: number
+  batchMaxMs?: number
+  batchMaxBytes?: number
+  batchMaxRecords?: number
+  maxInflight?: number
+  retentionDays?: number
+  timeSlice?: TimeSliceNapi
+  defaultService?: string
+}
+
+export interface TelemetryCursorNapi {
+  slice: string
+  lastIds: Array<number>
+}
+
+export interface TelemetryRecordNapi {
+  tsMs: number
+  kind: TelemetryKindNapi
+  tenantId?: string
+  tenantHash?: number
+  eventGlobalPos?: number
+  streamId?: string
+  streamHash?: number
+  streamRev?: number
+  commandId?: string
+  traceId?: string
+  spanId?: string
+  parentSpanId?: string
+  name?: string
+  service?: string
+  severity?: number
+  message?: string
+  metricName?: string
+  metricValue?: number
+  metricKind?: MetricKindNapi
+  metricUnit?: string
+  spanStartMs?: number
+  spanEndMs?: number
+  spanDurationMs?: number
+  spanStatus?: SpanStatusNapi
+  attrsJson?: string
+}
+
+export interface TelemetryQueryNapi {
+  tenantId?: string
+  tenantHash?: number
+  kind?: TelemetryKindNapi
+  startMs?: number
+  endMs?: number
+  severity?: number
+  metricName?: string
+  eventGlobalPos?: number
+  streamId?: string
+  streamHash?: number
+  streamRev?: number
+  commandId?: string
+  traceId?: string
+  limit?: number
+  order?: TelemetryOrderNapi
+  slice?: string
+  shardId?: number
+}
+
+export interface TelemetryTailResultNapi {
+  records: Array<TelemetryRecordNapi>
+  cursor: TelemetryCursorNapi
+}
+
+export declare class TelemetryDbNapi {
+  static open(root: string, config?: TelemetryConfigNapi): Promise<TelemetryDbNapi>
+  write(record: TelemetryRecordNapi): Promise<void>
+  writeBatch(records: Array<TelemetryRecordNapi>): Promise<void>
+  flush(): Promise<void>
+  query(query: TelemetryQueryNapi): Promise<Array<TelemetryRecordNapi>>
+  tail(cursor: TelemetryCursorNapi, limit: number): Promise<TelemetryTailResultNapi>
+  cleanupRetention(): Promise<void>
+}
+`;
+
 if (!indexContent.includes('Re-export projection system')) {
   indexContent += jsExports;
   writeFileSync(indexDts, indexContent);
   console.log('Added JS exports to index.d.ts');
 } else {
   console.log('JS exports already present in index.d.ts');
+}
+
+if (!indexContent.includes('TelemetryDbNapi')) {
+  indexContent += telemetryTypes;
+  writeFileSync(indexDts, indexContent);
+  console.log('Added telemetry types to index.d.ts');
 }
 
 // Ensure DEFAULT_TENANT export is present
@@ -63,6 +157,14 @@ if (!indexContent.includes('export const SpiteDBNapi')) {
   console.log('SpiteDBNapi value export already present in index.d.ts');
 }
 
+// Ensure TelemetryDbNapi value export is present
+const telemetryValueExport = '\nexport const TelemetryDBNapi: typeof TelemetryDbNapi\n';
+if (indexContent.includes('TelemetryDbNapi') && !indexContent.includes('TelemetryDBNapi')) {
+  indexContent += telemetryValueExport;
+  writeFileSync(indexDts, indexContent);
+  console.log('Added TelemetryDBNapi value export to index.d.ts');
+}
+
 // Fix js/types.d.ts - add node types reference for Buffer
 const typesDts = join(rootDir, 'js', 'types.d.ts');
 let typesContent = readFileSync(typesDts, 'utf8');
@@ -79,7 +181,17 @@ if (!typesContent.includes('<reference types="node"')) {
 // Ensure DEFAULT_TENANT export exists in runtime index.js
 const indexJs = join(rootDir, 'index.js');
 let indexJsContent = readFileSync(indexJs, 'utf8');
+if (indexJsContent.includes('const { SpiteDbNapi } = nativeBinding') && !indexJsContent.includes('TelemetryDbNapi')) {
+  indexJsContent = indexJsContent.replace(
+    'const { SpiteDbNapi } = nativeBinding',
+    'const { SpiteDbNapi, TelemetryDbNapi } = nativeBinding'
+  );
+  writeFileSync(indexJs, indexJsContent);
+  console.log('Updated native binding destructure to include TelemetryDbNapi');
+}
+
 const runtimeSpiteDbAlias = "\nmodule.exports.SpiteDBNapi = SpiteDbNapi\n";
+const runtimeTelemetryAlias = "\nmodule.exports.TelemetryDbNapi = TelemetryDbNapi\nmodule.exports.TelemetryDBNapi = TelemetryDbNapi\n";
 const runtimeDefaultTenant = "\n// Default tenant for single-tenant apps\nmodule.exports.DEFAULT_TENANT = 'default'\n";
 if (!indexJsContent.includes('SpiteDBNapi')) {
   indexJsContent += runtimeSpiteDbAlias;
@@ -87,6 +199,11 @@ if (!indexJsContent.includes('SpiteDBNapi')) {
   console.log('Added SpiteDBNapi alias to index.js');
 } else {
   console.log('SpiteDBNapi alias already present in index.js');
+}
+if (indexJsContent.includes('TelemetryDbNapi') && !indexJsContent.includes('TelemetryDBNapi')) {
+  indexJsContent += runtimeTelemetryAlias;
+  writeFileSync(indexJs, indexJsContent);
+  console.log('Added TelemetryDbNapi alias to index.js');
 }
 if (!indexJsContent.includes('DEFAULT_TENANT')) {
   indexJsContent += runtimeDefaultTenant;

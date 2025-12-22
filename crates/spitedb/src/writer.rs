@@ -757,7 +757,7 @@ impl BatchWriter {
             let hash = entry.stream_id.hash();
             self.heads_committed
                 .entry(hash)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(entry);
         }
 
@@ -1484,10 +1484,10 @@ impl BatchWriter {
                     let (_, batch_idx, sub_idx, is_batch_append) = flat_commands[validated.flat_index];
                     if is_batch_append {
                         // For BatchAppend: fill in the result at the sub index
-                        if let BatchResult::BatchAppend(Ok(ref mut ba_results)) = results[batch_idx] {
-                            if let Some(idx) = sub_idx {
-                                ba_results[idx] = result;
-                            }
+                        if let (BatchResult::BatchAppend(Ok(ba_results)), Some(idx)) =
+                            (&mut results[batch_idx], sub_idx)
+                        {
+                            ba_results[idx] = result;
                         }
                     } else {
                         // For Single/Transaction
@@ -1723,7 +1723,7 @@ impl BatchWriter {
         // Merge staged heads into committed
         for ((_stream_id, _tenant_hash), entry) in self.staged.heads.drain() {
             let stream_hash = entry.stream_id.hash();
-            let entries = self.heads_committed.entry(stream_hash).or_insert_with(Vec::new);
+            let entries = self.heads_committed.entry(stream_hash).or_default();
 
             // Update or add
             if let Some(existing) = entries
@@ -2815,16 +2815,14 @@ pub async fn run_batch_writer(
         // This ensures batches are bounded even under sustained high load.
         // Without this check, under high load rx.recv() always returns immediately
         // (message available), so the timeout never fires and batches grow unbounded.
-        if let Some(start) = batch_start {
-            if start.elapsed() >= config.batch_timeout {
-                let accum_time = start.elapsed();
-                eprintln!("[rust-batch] trigger=timeout_proactive items={} bytes={} accum={:.2}ms",
-                    batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
-                writer.execute_batch(std::mem::take(&mut batch));
-                batch_start = None;
-                batch_bytes = 0;
-                continue; // Restart loop to receive next request
-            }
+        if let Some(start) = batch_start && start.elapsed() >= config.batch_timeout {
+            let accum_time = start.elapsed();
+            eprintln!("[rust-batch] trigger=timeout_proactive items={} bytes={} accum={:.2}ms",
+                batch.len(), batch_bytes, accum_time.as_secs_f64() * 1000.0);
+            writer.execute_batch(std::mem::take(&mut batch));
+            batch_start = None;
+            batch_bytes = 0;
+            continue; // Restart loop to receive next request
         }
 
         // Calculate timeout for batch (remaining time)

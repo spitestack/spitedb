@@ -26,6 +26,8 @@ use crate::crypto::{BatchCryptor, AES_GCM_NONCE_SIZE};
 use crate::error::Result;
 use crate::types::EventData;
 
+type EncodedBatch = (Vec<u8>, [u8; AES_GCM_NONCE_SIZE], Vec<(usize, usize)>);
+
 // =============================================================================
 // Encoding
 // =============================================================================
@@ -48,7 +50,7 @@ pub fn encode_batch(
     events: &[EventData],
     batch_id: i64,
     cryptor: &BatchCryptor,
-) -> Result<(Vec<u8>, [u8; AES_GCM_NONCE_SIZE], Vec<(usize, usize)>)> {
+) -> Result<EncodedBatch> {
     encode_batch_iter(events.iter().map(|e| e.data.as_slice()), batch_id, cryptor)
 }
 
@@ -73,7 +75,7 @@ pub fn encode_batch_iter<'a>(
     event_data: impl Iterator<Item = &'a [u8]>,
     batch_id: i64,
     cryptor: &BatchCryptor,
-) -> Result<(Vec<u8>, [u8; AES_GCM_NONCE_SIZE], Vec<(usize, usize)>)> {
+) -> Result<EncodedBatch> {
     // Concatenate raw payloads
     let mut data = Vec::new();
     let mut offsets = Vec::new();

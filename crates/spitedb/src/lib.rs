@@ -123,6 +123,11 @@ pub mod api;
 /// - Staged/committed state separation for memory safety
 pub mod writer;
 
+/// Telemetry store for logs, metrics, and traces.
+///
+/// This module provides partitioned, time-sliced telemetry storage correlated
+/// to the event log.
+pub mod telemetry;
 
 /// Tombstones for GDPR-compliant deletion.
 ///
@@ -167,3 +172,9 @@ pub use types::{
 
 // Re-export tombstone utilities
 pub use tombstones::{CompactionJob, CompactionStats};
+
+// Re-export telemetry types.
+pub use telemetry::{
+    EventRef, MetricKind, SpanStatus, TelemetryConfig, TelemetryCursor, TelemetryDB,
+    TelemetryKind, TelemetryOrder, TelemetryQuery, TelemetryRecord, TimeSlice,
+};

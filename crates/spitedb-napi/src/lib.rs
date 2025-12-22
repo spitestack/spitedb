@@ -3,7 +3,7 @@
 //! This crate provides Node.js/Bun bindings for SpiteDB, enabling JavaScript
 //! applications to use the event store with native performance.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -12,7 +12,9 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 use spitedb::{
     AppendCommand, AppendResult, CommandId, Event, EventData, GlobalPos, MetricsSnapshot, SpiteDB,
-    SqlStatement, SqlValue, StreamId, StreamRev, Tenant,
+    SqlStatement, SqlValue, StreamHash, StreamId, StreamRev, Tenant, TenantHash,
+    TelemetryConfig, TelemetryCursor, TelemetryDB, TelemetryKind, TelemetryOrder, TelemetryQuery,
+    TelemetryRecord, TimeSlice, MetricKind, SpanStatus,
 };
 
 mod projection;
@@ -575,8 +577,615 @@ impl SpiteDBNapi {
 }
 
 // =============================================================================
+// Telemetry NAPI Wrapper
+// =============================================================================
+
+/// NAPI wrapper for the telemetry store.
+#[napi]
+pub struct TelemetryDbNapi {
+    inner: Arc<StdMutex<TelemetryDB>>,
+}
+
+#[napi]
+impl TelemetryDbNapi {
+    /// Opens (or creates) a telemetry store under the given root directory.
+    #[napi(factory)]
+    pub async fn open(root: String, config: Option<TelemetryConfigNapi>) -> Result<Self> {
+        let config = config.unwrap_or_else(TelemetryConfigNapi::default_config);
+        let telemetry_config = config.to_config()?;
+
+        let db = tokio::task::spawn_blocking(move || TelemetryDB::open(root, telemetry_config))
+            .await
+            .map_err(|e| Error::from_reason(format!("Telemetry open task failed: {}", e)))?
+            .map_err(|e| Error::from_reason(format!("Failed to open telemetry store: {}", e)))?;
+
+        Ok(Self {
+            inner: Arc::new(StdMutex::new(db)),
+        })
+    }
+
+    /// Writes a single telemetry record.
+    #[napi]
+    pub async fn write(&self, record: TelemetryRecordNapi) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let record = record.into_record()?;
+            let db = db
+                .lock()
+                .map_err(|_| Error::from_reason("Telemetry DB lock poisoned"))?;
+            db.write(record)
+                .map_err(|e| Error::from_reason(format!("Telemetry write failed: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("Telemetry write task failed: {}", e)))?
+    }
+
+    /// Writes multiple telemetry records.
+    #[napi]
+    pub async fn write_batch(&self, records: Vec<TelemetryRecordNapi>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut converted = Vec::with_capacity(records.len());
+            for record in records {
+                converted.push(record.into_record()?);
+            }
+            let db = db
+                .lock()
+                .map_err(|_| Error::from_reason("Telemetry DB lock poisoned"))?;
+            db.write_batch(converted)
+                .map_err(|e| Error::from_reason(format!("Telemetry batch write failed: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("Telemetry write task failed: {}", e)))?
+    }
+
+    /// Flushes all telemetry writers.
+    #[napi]
+    pub async fn flush(&self) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|_| Error::from_reason("Telemetry DB lock poisoned"))?;
+            db.flush()
+                .map_err(|e| Error::from_reason(format!("Telemetry flush failed: {}", e)))
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("Telemetry flush task failed: {}", e)))?
+    }
+
+    /// Queries telemetry records.
+    #[napi]
+    pub async fn query(&self, query: TelemetryQueryNapi) -> Result<Vec<TelemetryRecordNapi>> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let query = query.into_query()?;
+            let db = db
+                .lock()
+                .map_err(|_| Error::from_reason("Telemetry DB lock poisoned"))?;
+            let records = db
+                .query(query)
+                .map_err(|e| Error::from_reason(format!("Telemetry query failed: {}", e)))?;
+            Ok(records.into_iter().map(TelemetryRecordNapi::from).collect())
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("Telemetry query task failed: {}", e)))?
+    }
+
+    /// Tails a specific shard starting from a cursor.
+    #[napi]
+    pub async fn tail(
+        &self,
+        cursor: TelemetryCursorNapi,
+        limit: i64,
+    ) -> Result<TelemetryTailResultNapi> {
+        if limit <= 0 {
+            return Ok(TelemetryTailResultNapi {
+                records: Vec::new(),
+                cursor,
+            });
+        }
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let cursor_native = cursor.to_cursor()?;
+            let db = db
+                .lock()
+                .map_err(|_| Error::from_reason("Telemetry DB lock poisoned"))?;
+            let (records, next_cursor) = db
+                .tail(&cursor_native, limit as usize)
+                .map_err(|e| Error::from_reason(format!("Telemetry tail failed: {}", e)))?;
+            Ok(TelemetryTailResultNapi {
+                records: records.into_iter().map(TelemetryRecordNapi::from).collect(),
+                cursor: TelemetryCursorNapi::from(next_cursor),
+            })
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("Telemetry tail task failed: {}", e)))?
+    }
+
+    /// Drops telemetry slices older than the retention window.
+    #[napi]
+    pub async fn cleanup_retention(&self) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let db = db
+                .lock()
+                .map_err(|_| Error::from_reason("Telemetry DB lock poisoned"))?;
+            db.cleanup_retention().map_err(|e| {
+                Error::from_reason(format!("Telemetry retention cleanup failed: {}", e))
+            })
+        })
+        .await
+        .map_err(|e| Error::from_reason(format!("Telemetry cleanup task failed: {}", e)))?
+    }
+}
+
+// =============================================================================
 // NAPI Types
 // =============================================================================
+
+/// Telemetry record kind.
+#[napi(string_enum)]
+pub enum TelemetryKindNapi {
+    Log,
+    Metric,
+    Span,
+}
+
+impl From<TelemetryKindNapi> for TelemetryKind {
+    fn from(value: TelemetryKindNapi) -> Self {
+        match value {
+            TelemetryKindNapi::Log => TelemetryKind::Log,
+            TelemetryKindNapi::Metric => TelemetryKind::Metric,
+            TelemetryKindNapi::Span => TelemetryKind::Span,
+        }
+    }
+}
+
+impl From<TelemetryKind> for TelemetryKindNapi {
+    fn from(value: TelemetryKind) -> Self {
+        match value {
+            TelemetryKind::Log => TelemetryKindNapi::Log,
+            TelemetryKind::Metric => TelemetryKindNapi::Metric,
+            TelemetryKind::Span => TelemetryKindNapi::Span,
+        }
+    }
+}
+
+/// Metric aggregation semantics.
+#[napi(string_enum)]
+pub enum MetricKindNapi {
+    Gauge,
+    Counter,
+    Histogram,
+    Summary,
+}
+
+impl From<MetricKindNapi> for MetricKind {
+    fn from(value: MetricKindNapi) -> Self {
+        match value {
+            MetricKindNapi::Gauge => MetricKind::Gauge,
+            MetricKindNapi::Counter => MetricKind::Counter,
+            MetricKindNapi::Histogram => MetricKind::Histogram,
+            MetricKindNapi::Summary => MetricKind::Summary,
+        }
+    }
+}
+
+impl From<MetricKind> for MetricKindNapi {
+    fn from(value: MetricKind) -> Self {
+        match value {
+            MetricKind::Gauge => MetricKindNapi::Gauge,
+            MetricKind::Counter => MetricKindNapi::Counter,
+            MetricKind::Histogram => MetricKindNapi::Histogram,
+            MetricKind::Summary => MetricKindNapi::Summary,
+        }
+    }
+}
+
+/// Span status code.
+#[napi(string_enum)]
+pub enum SpanStatusNapi {
+    Unset,
+    Ok,
+    Error,
+}
+
+impl From<SpanStatusNapi> for SpanStatus {
+    fn from(value: SpanStatusNapi) -> Self {
+        match value {
+            SpanStatusNapi::Unset => SpanStatus::Unset,
+            SpanStatusNapi::Ok => SpanStatus::Ok,
+            SpanStatusNapi::Error => SpanStatus::Error,
+        }
+    }
+}
+
+impl From<SpanStatus> for SpanStatusNapi {
+    fn from(value: SpanStatus) -> Self {
+        match value {
+            SpanStatus::Unset => SpanStatusNapi::Unset,
+            SpanStatus::Ok => SpanStatusNapi::Ok,
+            SpanStatus::Error => SpanStatusNapi::Error,
+        }
+    }
+}
+
+/// Sort order for queries.
+#[napi(string_enum)]
+pub enum TelemetryOrderNapi {
+    Asc,
+    Desc,
+}
+
+impl From<TelemetryOrderNapi> for TelemetryOrder {
+    fn from(value: TelemetryOrderNapi) -> Self {
+        match value {
+            TelemetryOrderNapi::Asc => TelemetryOrder::Asc,
+            TelemetryOrderNapi::Desc => TelemetryOrder::Desc,
+        }
+    }
+}
+
+impl From<TelemetryOrder> for TelemetryOrderNapi {
+    fn from(value: TelemetryOrder) -> Self {
+        match value {
+            TelemetryOrder::Asc => TelemetryOrderNapi::Asc,
+            TelemetryOrder::Desc => TelemetryOrderNapi::Desc,
+        }
+    }
+}
+
+/// Time-slice policy.
+#[napi(string_enum)]
+pub enum TimeSliceNapi {
+    Daily,
+}
+
+impl From<TimeSliceNapi> for TimeSlice {
+    fn from(value: TimeSliceNapi) -> Self {
+        match value {
+            TimeSliceNapi::Daily => TimeSlice::Daily,
+        }
+    }
+}
+
+/// Configuration for telemetry storage.
+#[napi(object)]
+pub struct TelemetryConfigNapi {
+    pub app_name: Option<String>,
+    pub partitions: Option<u32>,
+    pub batch_max_ms: Option<u32>,
+    pub batch_max_bytes: Option<u32>,
+    pub batch_max_records: Option<u32>,
+    pub max_inflight: Option<u32>,
+    pub retention_days: Option<u32>,
+    pub time_slice: Option<TimeSliceNapi>,
+    pub default_service: Option<String>,
+}
+
+impl TelemetryConfigNapi {
+    fn default_config() -> Self {
+        Self {
+            app_name: Some("app".to_string()),
+            partitions: None,
+            batch_max_ms: None,
+            batch_max_bytes: None,
+            batch_max_records: None,
+            max_inflight: None,
+            retention_days: None,
+            time_slice: None,
+            default_service: None,
+        }
+    }
+
+    fn to_config(&self) -> Result<TelemetryConfig> {
+        let app_name = self.app_name.clone().unwrap_or_else(|| "app".to_string());
+        let mut config = TelemetryConfig::new(app_name);
+
+        if let Some(partitions) = self.partitions {
+            if partitions == 0 {
+                return Err(Error::from_reason("telemetry partitions must be >= 1"));
+            }
+            config.partitions = partitions as usize;
+        }
+
+        if let Some(batch_max_ms) = self.batch_max_ms {
+            config.batch_max_ms = batch_max_ms as u64;
+        }
+
+        if let Some(batch_max_bytes) = self.batch_max_bytes {
+            config.batch_max_bytes = batch_max_bytes as usize;
+        }
+
+        if let Some(batch_max_records) = self.batch_max_records {
+            config.batch_max_records = batch_max_records as usize;
+        }
+
+        if let Some(max_inflight) = self.max_inflight {
+            config.max_inflight = max_inflight as usize;
+        }
+
+        if let Some(retention_days) = self.retention_days {
+            config.retention_days = retention_days as u64;
+        }
+
+        if let Some(time_slice) = self.time_slice {
+            config.time_slice = time_slice.into();
+        }
+
+        if let Some(default_service) = self.default_service.clone() {
+            config.default_service = Some(default_service);
+        }
+
+        Ok(config)
+    }
+}
+
+/// Cursor for tailing a telemetry shard.
+#[napi(object)]
+pub struct TelemetryCursorNapi {
+    pub slice: String,
+    pub last_ids: Vec<i64>,
+}
+
+impl TelemetryCursorNapi {
+    fn to_cursor(&self) -> Result<TelemetryCursor> {
+        Ok(TelemetryCursor {
+            slice: self.slice.clone(),
+            last_ids: self.last_ids.clone(),
+        })
+    }
+}
+
+impl From<TelemetryCursor> for TelemetryCursorNapi {
+    fn from(cursor: TelemetryCursor) -> Self {
+        Self {
+            slice: cursor.slice,
+            last_ids: cursor.last_ids,
+        }
+    }
+}
+
+/// Telemetry record payload for writes and reads.
+#[napi(object)]
+pub struct TelemetryRecordNapi {
+    pub ts_ms: i64,
+    pub kind: TelemetryKindNapi,
+    pub tenant_id: Option<String>,
+    pub tenant_hash: Option<i64>,
+
+    pub event_global_pos: Option<i64>,
+    pub stream_id: Option<String>,
+    pub stream_hash: Option<i64>,
+    pub stream_rev: Option<i64>,
+    pub command_id: Option<String>,
+
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+
+    pub name: Option<String>,
+    pub service: Option<String>,
+
+    pub severity: Option<i64>,
+    pub message: Option<String>,
+
+    pub metric_name: Option<String>,
+    pub metric_value: Option<f64>,
+    pub metric_kind: Option<MetricKindNapi>,
+    pub metric_unit: Option<String>,
+
+    pub span_start_ms: Option<i64>,
+    pub span_end_ms: Option<i64>,
+    pub span_duration_ms: Option<i64>,
+    pub span_status: Option<SpanStatusNapi>,
+
+    pub attrs_json: Option<String>,
+}
+
+impl TelemetryRecordNapi {
+    fn into_record(self) -> Result<TelemetryRecord> {
+        let ts_ms = non_negative("tsMs", self.ts_ms)? as u64;
+        let tenant_hash = if let Some(hash) = self.tenant_hash {
+            TenantHash::from_raw(hash)
+        } else {
+            let tenant = self
+                .tenant_id
+                .clone()
+                .unwrap_or_else(|| Tenant::DEFAULT_STR.to_string());
+            Tenant::new(tenant).hash()
+        };
+
+        let mut record = TelemetryRecord::new(self.kind.into(), ts_ms, tenant_hash);
+
+        record.event_global_pos = optional_global_pos(self.event_global_pos)?;
+
+        record.stream_hash = if let Some(stream_id) = self.stream_id {
+            Some(StreamId::new(stream_id).hash())
+        } else {
+            self.stream_hash.map(StreamHash::from_raw)
+        };
+
+        record.stream_rev = optional_stream_rev(self.stream_rev)?;
+        record.command_id = self.command_id.map(CommandId::from);
+
+        record.trace_id = self.trace_id;
+        record.span_id = self.span_id;
+        record.parent_span_id = self.parent_span_id;
+
+        record.name = self.name;
+        record.service = self.service;
+
+        record.severity = self.severity;
+        record.message = self.message;
+
+        record.metric_name = self.metric_name;
+        record.metric_value = self.metric_value;
+        record.metric_kind = self.metric_kind.map(Into::into);
+        record.metric_unit = self.metric_unit;
+
+        record.span_start_ms = optional_u64(self.span_start_ms, "spanStartMs")?;
+        record.span_end_ms = optional_u64(self.span_end_ms, "spanEndMs")?;
+        record.span_duration_ms = optional_u64(self.span_duration_ms, "spanDurationMs")?;
+        record.span_status = self.span_status.map(Into::into);
+
+        record.attrs_json = self.attrs_json;
+
+        Ok(record)
+    }
+}
+
+impl From<TelemetryRecord> for TelemetryRecordNapi {
+    fn from(record: TelemetryRecord) -> Self {
+        Self {
+            ts_ms: record.ts_ms as i64,
+            kind: record.kind.into(),
+            tenant_id: None,
+            tenant_hash: Some(record.tenant_hash.as_raw()),
+            event_global_pos: record.event_global_pos.map(|pos| pos.as_raw() as i64),
+            stream_id: None,
+            stream_hash: record.stream_hash.map(|hash| hash.as_raw()),
+            stream_rev: record.stream_rev.map(|rev| rev.as_raw() as i64),
+            command_id: record.command_id.map(|id| id.as_str().to_string()),
+            trace_id: record.trace_id,
+            span_id: record.span_id,
+            parent_span_id: record.parent_span_id,
+            name: record.name,
+            service: record.service,
+            severity: record.severity,
+            message: record.message,
+            metric_name: record.metric_name,
+            metric_value: record.metric_value,
+            metric_kind: record.metric_kind.map(Into::into),
+            metric_unit: record.metric_unit,
+            span_start_ms: record.span_start_ms.map(|value| value as i64),
+            span_end_ms: record.span_end_ms.map(|value| value as i64),
+            span_duration_ms: record.span_duration_ms.map(|value| value as i64),
+            span_status: record.span_status.map(Into::into),
+            attrs_json: record.attrs_json,
+        }
+    }
+}
+
+/// Query parameters for telemetry searches.
+#[napi(object)]
+pub struct TelemetryQueryNapi {
+    pub tenant_id: Option<String>,
+    pub tenant_hash: Option<i64>,
+    pub kind: Option<TelemetryKindNapi>,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub severity: Option<i64>,
+    pub metric_name: Option<String>,
+    pub event_global_pos: Option<i64>,
+    pub stream_id: Option<String>,
+    pub stream_hash: Option<i64>,
+    pub stream_rev: Option<i64>,
+    pub command_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub limit: Option<i64>,
+    pub order: Option<TelemetryOrderNapi>,
+    pub slice: Option<String>,
+    pub shard_id: Option<i64>,
+}
+
+impl TelemetryQueryNapi {
+    fn into_query(self) -> Result<TelemetryQuery> {
+        let mut query = TelemetryQuery::new();
+
+        query.tenant_hash = if let Some(hash) = self.tenant_hash {
+            Some(TenantHash::from_raw(hash))
+        } else {
+            self.tenant_id.map(|tenant| Tenant::new(tenant).hash())
+        };
+
+        query.kind = self.kind.map(Into::into);
+        query.start_ms = optional_u64(self.start_ms, "startMs")?;
+        query.end_ms = optional_u64(self.end_ms, "endMs")?;
+        query.severity = self.severity;
+        query.metric_name = self.metric_name;
+        query.event_global_pos = optional_global_pos(self.event_global_pos)?;
+
+        query.stream_hash = if let Some(stream_id) = self.stream_id {
+            Some(StreamId::new(stream_id).hash())
+        } else {
+            self.stream_hash.map(StreamHash::from_raw)
+        };
+
+        query.stream_rev = optional_stream_rev(self.stream_rev)?;
+        query.command_id = self.command_id.map(CommandId::from);
+        query.trace_id = self.trace_id;
+
+        query.limit = if let Some(limit) = self.limit {
+            if limit < 0 {
+                return Err(Error::from_reason("limit must be >= 0"));
+            }
+            Some(limit as usize)
+        } else {
+            None
+        };
+
+        query.order = self.order.map(Into::into).unwrap_or(TelemetryOrder::Desc);
+        query.slice = self.slice;
+        query.shard_id = if let Some(shard_id) = self.shard_id {
+            if shard_id < 0 {
+                return Err(Error::from_reason("shardId must be >= 0"));
+            }
+            Some(shard_id as usize)
+        } else {
+            None
+        };
+
+        Ok(query)
+    }
+}
+
+/// Result of a telemetry tail call.
+#[napi(object)]
+pub struct TelemetryTailResultNapi {
+    pub records: Vec<TelemetryRecordNapi>,
+    pub cursor: TelemetryCursorNapi,
+}
+
+fn non_negative(field: &str, value: i64) -> Result<u64> {
+    if value < 0 {
+        return Err(Error::from_reason(format!(
+            "{field} must be >= 0"
+        )));
+    }
+    Ok(value as u64)
+}
+
+fn optional_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
+    match value {
+        Some(value) => Ok(Some(non_negative(field, value)?)),
+        None => Ok(None),
+    }
+}
+
+fn optional_global_pos(value: Option<i64>) -> Result<Option<GlobalPos>> {
+    match value {
+        Some(value) => {
+            let raw = non_negative("eventGlobalPos", value)?;
+            if raw == 0 {
+                return Err(Error::from_reason("eventGlobalPos must be >= 1"));
+            }
+            Ok(Some(GlobalPos::from_raw(raw)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn optional_stream_rev(value: Option<i64>) -> Result<Option<StreamRev>> {
+    match value {
+        Some(value) => Ok(Some(StreamRev::from_raw(non_negative("streamRev", value)?))),
+        None => Ok(None),
+    }
+}
 
 /// Result of an append operation.
 #[napi(object)]

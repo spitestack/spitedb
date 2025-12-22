@@ -11,7 +11,7 @@ pub use aggregate::{
     AggregateIR, CommandIR, EventTypeIR, EventVariant, EventField,
     StatementIR, ExpressionIR, BinaryOp, UnaryOp,
 };
-pub use orchestrator::OrchestratorIR;
+pub use orchestrator::{OrchestratorDependency, OrchestratorIR};
 
 use std::path::PathBuf;
 

@@ -38,7 +38,7 @@ impl ColumnType {
     }
 
     /// Parses from string (case-insensitive).
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "text" | "string" => Some(ColumnType::Text),
             "integer" | "int" | "bigint" => Some(ColumnType::Integer),
@@ -64,7 +64,7 @@ impl From<ColumnDefNapi> for ColumnDef {
     fn from(napi: ColumnDefNapi) -> Self {
         Self {
             name: napi.name,
-            col_type: ColumnType::from_str(&napi.col_type).unwrap_or(ColumnType::Text),
+            col_type: ColumnType::parse(&napi.col_type).unwrap_or(ColumnType::Text),
             primary_key: napi.primary_key,
             nullable: napi.nullable,
             default_value: napi

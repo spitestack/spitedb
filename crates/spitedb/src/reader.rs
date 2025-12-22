@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rusqlite::{params, Connection};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::codec::decode_batch;
 use crate::crypto::{BatchCryptor, AES_GCM_NONCE_SIZE};
@@ -59,7 +59,7 @@ use crate::Error;
 /// Returns an error if the offset/length would go out of bounds, which indicates
 /// either database corruption or a bug in the event indexing logic.
 fn extract_event_data(decrypted: &[u8], offset: usize, len: usize, global_pos: u64) -> Result<Vec<u8>> {
-    if offset.checked_add(len).map_or(true, |end| end > decrypted.len()) {
+    if offset.checked_add(len).is_none_or(|end| end > decrypted.len()) {
         return Err(Error::Schema(format!(
             "corrupted event index: global_pos={} has invalid bounds (offset={}, len={}, batch_len={})",
             global_pos, offset, len, decrypted.len()
@@ -460,12 +460,12 @@ pub fn get_stream_revision_tenant(conn: &Connection, stream_id: &StreamId, tenan
 pub async fn run_reader_pooled(
     conn: Connection,
     cryptor: Arc<BatchCryptor>,
-    rx: Arc<std::sync::Mutex<mpsc::Receiver<ReadRequest>>>,
+    rx: Arc<Mutex<mpsc::Receiver<ReadRequest>>>,
 ) {
     loop {
         // Lock the receiver to get the next request
         let request = {
-            let mut guard = rx.lock().expect("receiver mutex poisoned");
+            let mut guard = rx.lock().await;
             guard.recv().await
         };
 
