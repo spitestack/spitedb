@@ -1,0 +1,26 @@
+[package]
+name = "spite-compiler"
+version = "0.1.0"
+edition = "2021"
+description = "SpiteStack compiler core - TypeScript domain logic to TypeScript + Bun code generator"
+
+[[bin]]
+name = "debug_parse"
+path = "src/bin/debug_parse.rs"
+
+[lib]
+name = "spite_compiler"
+path = "src/lib.rs"
+
+[dependencies]
+# Parser
+tree-sitter = "0.23"
+tree-sitter-typescript = "0.23"
+
+# Diagnostics
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
+
+# File System
+walkdir = "2"
+pathdiff = "0.2"

@@ -1,0 +1,24 @@
+[package]
+name = "spitestack-cli"
+version = "0.1.0"
+edition = "2021"
+description = "SpiteStack CLI - Compile TypeScript domain logic to Rust with hot reload"
+
+[[bin]]
+name = "spitestack"
+path = "src/main.rs"
+
+[dependencies]
+spite-compiler = { path = "../spite-compiler" }
+
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+indicatif = "0.17"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+atty = "0.2"
+notify = { version = "6", features = ["macos_fsevent"] }
+notify-debouncer-mini = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "sync"] }
+miette = { version = "7", features = ["fancy"] }
+open = "5"

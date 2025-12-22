@@ -1,8 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "packages/spitedb",
-    "packages/spitedb/napi",
+    "crates/spite-compiler",
+    "crates/spitestack-cli",
+    "crates/spitedb",
+    "crates/spitedb-napi",
+]
+exclude = [
+    "packages/examples/typescript/.spitestack",
 ]
 
 [profile.release]

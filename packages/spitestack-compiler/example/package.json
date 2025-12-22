@@ -1,8 +1,0 @@
-{
-  "name": "@spitestack/compiler-example",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "better-auth": "latest"
-  }
-}

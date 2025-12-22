@@ -1,0 +1,3 @@
+.spitestack/
+node_modules/
+*.db

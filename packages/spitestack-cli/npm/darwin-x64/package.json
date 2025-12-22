@@ -1,0 +1,16 @@
+{
+  "name": "@spitestack/cli-darwin-x64",
+  "version": "0.1.0-alpha.5",
+  "description": "SpiteStack CLI binary for macOS x64 (Intel)",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "spitestack",
+  "files": [
+    "spitestack"
+  ],
+  "license": "MIT"
+}

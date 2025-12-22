@@ -1,0 +1,38 @@
+[package]
+name = "spitedb-napi"
+version = "0.1.0"
+edition = "2024"
+description = "NAPI bindings for SpiteDB - event store with projections"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# SpiteDB core
+spitedb = { path = "../spitedb" }
+
+# NAPI bindings for Node.js/Bun
+# - async: enables async function support
+# - napi8: targets Node.js 18+ API
+# - serde-json: enables automatic JSON conversion
+napi = { version = "2", default-features = false, features = ["async", "napi8", "serde-json"] }
+napi-derive = "2"
+
+# Async runtime (shared with spitedb)
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+# Serialization for cross-boundary data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SQLite for projection tables (separate connection from event store)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Base64 encoding for blob columns
+base64 = "0.22"
+
+[build-dependencies]
+napi-build = "2"
+
+[dev-dependencies]
+tempfile = "3"
