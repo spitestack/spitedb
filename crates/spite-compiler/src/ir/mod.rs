@@ -4,9 +4,11 @@
 //! It represents the domain concepts (aggregates, events, orchestrators) in a
 //! way that's independent of the source language.
 
+mod access;
 mod aggregate;
 mod orchestrator;
 
+pub use access::{AccessLevel, AppConfig, AppMode, EntityAccessConfig, MethodAccessConfig};
 pub use aggregate::{
     AggregateIR, CommandIR, EventTypeIR, EventVariant, EventField,
     StatementIR, ExpressionIR, BinaryOp, UnaryOp,
@@ -65,6 +67,8 @@ pub struct DomainIR {
     pub aggregates: Vec<AggregateIR>,
     pub orchestrators: Vec<OrchestratorIR>,
     pub source_dir: PathBuf,
+    /// App configuration for access control (parsed from index.ts).
+    pub app_config: Option<AppConfig>,
 }
 
 impl DomainIR {
@@ -73,6 +77,7 @@ impl DomainIR {
             aggregates: Vec::new(),
             orchestrators: Vec::new(),
             source_dir,
+            app_config: None,
         }
     }
 }

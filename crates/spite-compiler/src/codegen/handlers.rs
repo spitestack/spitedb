@@ -16,7 +16,7 @@ pub fn generate_handlers(aggregate: &AggregateIR, domain_import_path: &str) -> S
 
     // Imports
     code.push_str(&format!(
-        r#"import type {{ SpiteDbNapi, TelemetryDbNapi }} from '@spitestack/db';
+        r#"import type {{ SpiteDbNapi, TelemetryDbNapi, TelemetryRecordNapi }} from '@spitestack/db';
 import {{ {name}Aggregate }} from '{domain_import_path}/{name}/aggregate';
 import type {{ {name}Event }} from '{domain_import_path}/{name}/events';
 import {{ emitTelemetry, finishSpan, logError, logWarn, metricCounter, metricHistogram, startSpan }} from '../runtime/telemetry';
@@ -75,7 +75,7 @@ export async function handle{name}Get(
     streamId,
   }});
   const startMs = Date.now();
-  const records = [];
+  const records: TelemetryRecordNapi[] = [];
 
   const finalize = (response: Response, status: 'Ok' | 'Error', err?: unknown) => {{
     const endMs = Date.now();
@@ -164,7 +164,7 @@ export async function handle{name}{cmd_pascal}(
     command: '{cmd_pascal}',
   }});
   const startMs = Date.now();
-  const records = [];
+  const records: TelemetryRecordNapi[] = [];
   const finalize = (response: Response, status: 'Ok' | 'Error', err?: unknown) => {{
     const endMs = Date.now();
     records.push(
@@ -308,6 +308,8 @@ mod tests {
                 })
                 .collect(),
             body: vec![],
+            access: crate::ir::AccessLevel::Internal,
+            roles: vec![],
         }
     }
 
@@ -316,7 +318,7 @@ mod tests {
         let agg = make_test_aggregate("Todo", vec![]);
         let code = generate_handlers(&agg, "../../domain");
 
-        assert!(code.contains("import type { SpiteDbNapi, TelemetryDbNapi } from '@spitestack/db'"));
+        assert!(code.contains("import type { SpiteDbNapi, TelemetryDbNapi, TelemetryRecordNapi } from '@spitestack/db'"));
         assert!(code.contains("import { TodoAggregate } from '../../domain/Todo/aggregate'"));
         assert!(code.contains("import type { TodoEvent } from '../../domain/Todo/events'"));
     }

@@ -1,6 +1,6 @@
 //! Convert TypeScript AST to language-agnostic IR.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::diagnostic::CompilerError;
 use crate::ir::{
     AggregateIR, CommandIR, DomainIR, DomainType, EventTypeIR, EventVariant, EventField,
@@ -58,7 +58,7 @@ fn convert_aggregate(
     class: &ClassDecl,
     event_types: &[&TypeAlias],
     state_types: &[&TypeAlias],
-    source_path: &PathBuf,
+    source_path: &Path,
 ) -> Result<AggregateIR, CompilerError> {
     let name = class.name.trim_end_matches("Aggregate").to_string();
 
@@ -101,7 +101,7 @@ fn convert_aggregate(
                 && !m.name.starts_with("get_")
                 && !m.name.starts_with("set_")
         })
-        .map(|m| convert_command(m))
+        .map(convert_command)
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract raw apply body for TS→TS pass-through
@@ -113,7 +113,7 @@ fn convert_aggregate(
 
     Ok(AggregateIR {
         name,
-        source_path: source_path.clone(),
+        source_path: source_path.to_path_buf(),
         state,
         initial_state,
         events,
@@ -128,7 +128,7 @@ fn convert_event_type(type_alias: &TypeAlias) -> Result<EventTypeIR, CompilerErr
         TypeNode::Union(members) => {
             members
                 .iter()
-                .map(|m| convert_event_variant(m))
+                .map(convert_event_variant)
                 .collect::<Result<Vec<_>, _>>()?
         }
         TypeNode::ObjectLiteral(props) => {
@@ -346,6 +346,9 @@ fn convert_command(method: &MethodDecl) -> Result<CommandIR, CompilerError> {
         name: method.name.clone(),
         parameters,
         body,
+        // Default to Internal - access config will be applied later
+        access: crate::ir::AccessLevel::Internal,
+        roles: Vec::new(),
     })
 }
 
@@ -607,5 +610,31 @@ fn convert_expression(expr: &Expression) -> Result<ExpressionIR, CompilerError> 
             })
         }
         _ => Ok(ExpressionIR::Identifier("unknown".to_string())),
+    }
+}
+
+/// Applies access configuration from App registration to the domain IR.
+///
+/// This function merges access configurations parsed from index.ts with
+/// the aggregate commands. Each command gets its access level and roles based on:
+/// 1. Method-specific configuration (if present)
+/// 2. Entity-level defaults (if present)
+/// 3. System default (Internal, no roles)
+pub fn apply_access_config(domain: &mut DomainIR, app_config: &crate::ir::AppConfig) {
+    for aggregate in &mut domain.aggregates {
+        // Look for config by aggregate name (with or without "Aggregate" suffix)
+        let entity_config = app_config
+            .entities
+            .get(&aggregate.name)
+            .or_else(|| app_config.entities.get(&format!("{}Aggregate", aggregate.name)))
+            .cloned()
+            .unwrap_or_default();
+
+        // Apply access config to each command
+        for cmd in &mut aggregate.commands {
+            let method_config = entity_config.resolve_method(&cmd.name);
+            cmd.access = method_config.access;
+            cmd.roles = method_config.roles;
+        }
     }
 }

@@ -138,6 +138,49 @@ pub enum CompilerError {
     },
 
     // =========================================================================
+    // Schema Evolution Errors
+    // =========================================================================
+    #[error("Breaking schema change detected in {aggregate}.{event}")]
+    #[diagnostic(
+        code(spitestack::schema::breaking_change),
+        help("Breaking changes are not allowed in production mode.\n\
+              \n\
+              Options:\n\
+              1. Create a new event type (e.g., '{event}V2') with the new schema\n\
+              2. Switch to greenfield mode: new App({{ mode: 'greenfield' }})\n\
+              3. Run `spitestack schema reset --i-know-what-im-doing` (WARNING: existing events won't replay correctly)\n\
+              \n\
+              Learn more: https://spitestack.dev/docs/event-evolution")
+    )]
+    BreakingSchemaChange {
+        aggregate: String,
+        event: String,
+        changes: String,
+    },
+
+    #[error("Event '{aggregate}.{event}' was removed")]
+    #[diagnostic(
+        code(spitestack::schema::event_removed),
+        help("Removing events is a breaking change in production mode.\n\
+              If this event is no longer needed, you can:\n\
+              1. Keep the event type but deprecate it\n\
+              2. Switch to greenfield mode for development\n\
+              3. Run `spitestack schema reset --i-know-what-im-doing`")
+    )]
+    EventRemoved {
+        aggregate: String,
+        event: String,
+    },
+
+    #[error("Lock file generation required for production mode")]
+    #[diagnostic(
+        code(spitestack::schema::lock_file_required),
+        help("Run `spitestack schema sync` to generate the initial events.lock.json file.\n\
+              This captures your current event schemas and enables safe evolution.")
+    )]
+    LockFileRequired,
+
+    // =========================================================================
     // Analysis Errors
     // =========================================================================
     #[error("No aggregates found in domain directory")]

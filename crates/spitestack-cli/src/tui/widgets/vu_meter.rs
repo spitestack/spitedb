@@ -105,6 +105,7 @@ pub fn draw_vu_meters_tiered(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_single_track_tiered(
     f: &mut Frame,
     track_num: usize,

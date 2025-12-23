@@ -115,6 +115,52 @@ enum Commands {
         #[arg(short, long, default_value = "typescript")]
         language: String,
     },
+
+    /// Schema management commands for event evolution
+    Schema {
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
+}
+
+/// Schema management subcommands.
+#[derive(Subcommand)]
+enum SchemaAction {
+    /// Show current schema status and any pending changes
+    Status {
+        /// Domain source directory
+        #[arg(short, long, default_value = "src/domain")]
+        domain: PathBuf,
+    },
+
+    /// Generate or update the schema lock file
+    Sync {
+        /// Domain source directory
+        #[arg(short, long, default_value = "src/domain")]
+        domain: PathBuf,
+
+        /// Force sync even with breaking changes (dangerous!)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Show diff between current code and lock file
+    Diff {
+        /// Domain source directory
+        #[arg(short, long, default_value = "src/domain")]
+        domain: PathBuf,
+    },
+
+    /// Reset lock file (requires explicit confirmation)
+    Reset {
+        /// Domain source directory
+        #[arg(short, long, default_value = "src/domain")]
+        domain: PathBuf,
+
+        /// I understand this may cause data issues
+        #[arg(long)]
+        i_know_what_im_doing: bool,
+    },
 }
 
 #[tokio::main]
@@ -211,6 +257,10 @@ async fn main() -> miette::Result<()> {
         }) => {
             run_watch_mode(&domain, &output, &language).await?;
         }
+
+        Some(Commands::Schema { action }) => {
+            handle_schema_command(action).await?;
+        }
     }
 
     Ok(())
@@ -219,7 +269,7 @@ async fn main() -> miette::Result<()> {
 /// Initialize a new SpiteStack project.
 async fn init_project(
     path: &PathBuf,
-    domain: &PathBuf,
+    domain: &std::path::Path,
     _language: &str,
     _port: u16,
 ) -> miette::Result<()> {
@@ -347,7 +397,7 @@ export class TodoAggregate {
     println!("    cd {}", path.display());
     println!("    spitestack dev");
     println!();
-    ui::info(&format!("Docs (if you need 'em): https://spitestack.dev/docs"));
+    ui::info("Docs (if you need 'em): https://spitestack.dev/docs");
     println!();
 
     Ok(())
@@ -355,8 +405,8 @@ export class TodoAggregate {
 
 /// Compile domain logic to a TypeScript project.
 async fn compile_project(
-    domain: &PathBuf,
-    output: &PathBuf,
+    domain: &std::path::Path,
+    output: &std::path::Path,
     language: &str,
     skip_purity_check: bool,
     port: u16,
@@ -372,8 +422,8 @@ async fn compile_project(
     let spinner = ui::spinner("Compiling domain logic...");
 
     let config = CompilerConfig {
-        domain_dir: domain.clone(),
-        out_dir: output.clone(),
+        domain_dir: domain.to_path_buf(),
+        out_dir: output.to_path_buf(),
         skip_purity_check,
         language: language.to_string(),
     };
@@ -436,8 +486,8 @@ async fn compile_project(
 
 /// Run dev mode with hot reload.
 async fn run_dev_mode(
-    domain: &PathBuf,
-    output: &PathBuf,
+    domain: &std::path::Path,
+    output: &std::path::Path,
     language: &str,
     port: u16,
     skip_purity_check: bool,
@@ -475,8 +525,8 @@ async fn run_dev_mode(
         .unwrap_or_else(|| "spitestack-app".to_string());
 
     let config = CompilerConfig {
-        domain_dir: domain.clone(),
-        out_dir: output.clone(),
+        domain_dir: domain.to_path_buf(),
+        out_dir: output.to_path_buf(),
         skip_purity_check,
         language: language.to_string(),
     };
@@ -485,13 +535,11 @@ async fn run_dev_mode(
     compiler.compile_project(&project_name, port).await?;
 
     spinner.finish_and_clear();
-    ui::success("Initial compile complete");
-
     // Channel for file change events
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Set up file watcher
-    let domain_path = domain.clone();
+    let domain_path = domain.to_path_buf();
     let tx_clone = tx.clone();
 
     std::thread::spawn(move || {
@@ -524,7 +572,7 @@ async fn run_dev_mode(
     });
 
     // Start cargo run
-    let output_path = output.clone();
+    let output_path = output.to_path_buf();
 
     // Start server
     ui::info(&format!("Server starting on http://localhost:{}", port));
@@ -534,8 +582,8 @@ async fn run_dev_mode(
     ui::info("Ready! Waiting for changes...");
 
     // Watch for changes
-    let domain_clone = domain.clone();
-    let output_clone = output.clone();
+    let domain_clone = domain.to_path_buf();
+    let output_clone = output.to_path_buf();
     let language_clone = language.to_string();
 
     loop {
@@ -611,8 +659,8 @@ async fn run_dev_mode(
 
 /// Run watch mode without starting the server.
 async fn run_watch_mode(
-    domain: &PathBuf,
-    output: &PathBuf,
+    domain: &std::path::Path,
+    output: &std::path::Path,
     language: &str,
 ) -> miette::Result<()> {
     ui::info(&format!("Watching for changes in {}", domain.display()));
@@ -622,7 +670,7 @@ async fn run_watch_mode(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Set up file watcher
-    let domain_path = domain.clone();
+    let domain_path = domain.to_path_buf();
     let tx_clone = tx.clone();
 
     std::thread::spawn(move || {
@@ -654,8 +702,8 @@ async fn run_watch_mode(
         });
     });
 
-    let domain_clone = domain.clone();
-    let output_clone = output.clone();
+    let domain_clone = domain.to_path_buf();
+    let output_clone = output.to_path_buf();
     let language_clone = language.to_string();
 
     ui::info("Ready! Waiting for changes...");
@@ -730,4 +778,241 @@ async fn start_bun_dev(project_dir: &PathBuf) -> miette::Result<Child> {
         .map_err(|e| miette::miette!("Failed to start bun run dev: {}", e))?;
 
     Ok(child)
+}
+
+/// Handle schema management commands.
+async fn handle_schema_command(action: SchemaAction) -> miette::Result<()> {
+    match action {
+        SchemaAction::Status { domain } => {
+            schema_status(&domain).await?;
+        }
+        SchemaAction::Sync { domain, force } => {
+            schema_sync(&domain, force).await?;
+        }
+        SchemaAction::Diff { domain } => {
+            schema_diff(&domain).await?;
+        }
+        SchemaAction::Reset { domain, i_know_what_im_doing } => {
+            schema_reset(&domain, i_know_what_im_doing).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Show schema status.
+async fn schema_status(domain: &PathBuf) -> miette::Result<()> {
+    use spite_compiler::schema::SchemaLockFile;
+    use spite_compiler::ir::AppMode;
+
+    let spinner = ui::spinner("Loading schema information...");
+
+    // Parse domain to get app config
+    let mut frontend = spite_compiler::frontend::create_frontend("typescript")
+        .map_err(|e| miette::miette!("{}", e))?;
+    let domain_ir = frontend.parse_directory(domain)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    // Parse app config
+    let app_config = spite_compiler::frontend::typescript::app_parser::parse_app_config(domain)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    let mode = app_config.as_ref().map(|c| c.mode).unwrap_or(AppMode::Greenfield);
+
+    // Load lock file
+    let lock_path = domain.parent().unwrap_or(domain).join("events.lock.json");
+    let lock_file = SchemaLockFile::load(&lock_path)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    spinner.finish_and_clear();
+
+    println!();
+    ui::box_header(&format!("{} Schema Status", ui::symbols::DIAMOND));
+    ui::box_line("");
+    ui::box_line(&format!("Mode: {}", match mode {
+        AppMode::Greenfield => "greenfield (schemas can change freely)",
+        AppMode::Production => "production (schemas are locked)",
+    }));
+    ui::box_line(&format!("Lock file: {}", if lock_file.is_some() {
+        lock_path.display().to_string()
+    } else {
+        "not found".to_string()
+    }));
+    ui::box_line("");
+
+    // Show aggregates
+    ui::box_line("Aggregates:");
+    for agg in &domain_ir.aggregates {
+        let event_count = agg.events.variants.len();
+        ui::box_line(&format!("  {} ({} events)", agg.name, event_count));
+    }
+    ui::box_line("");
+
+    // If lock file exists and in production mode, check for changes
+    if let Some(ref locked) = lock_file {
+        if mode == AppMode::Production {
+            let diffs = spite_compiler::schema::diff_schemas(&locked.aggregates, &domain_ir);
+            if diffs.is_empty() {
+                ui::box_line("Status: No schema changes detected");
+            } else {
+                let breaking_count = diffs.iter().filter(|d| d.is_breaking()).count();
+                let safe_count = diffs.iter().filter(|d| d.can_auto_upcast()).count();
+
+                if breaking_count > 0 {
+                    ui::box_line(&format!("Status: {} breaking change(s) detected!", breaking_count));
+                    ui::box_line("        Run `spitestack schema diff` for details");
+                } else if safe_count > 0 {
+                    ui::box_line(&format!("Status: {} non-breaking change(s) detected", safe_count));
+                    ui::box_line("        These will be auto-upcasted on next compile");
+                }
+            }
+        }
+    } else if mode == AppMode::Production {
+        ui::box_line("Status: Lock file required for production mode");
+        ui::box_line("        Run `spitestack schema sync` to generate");
+    }
+
+    ui::box_footer();
+    println!();
+
+    Ok(())
+}
+
+/// Generate or update the schema lock file.
+async fn schema_sync(domain: &PathBuf, force: bool) -> miette::Result<()> {
+    use spite_compiler::schema::SchemaLockFile;
+
+    let spinner = ui::spinner("Syncing schema...");
+
+    // Parse domain
+    let mut frontend = spite_compiler::frontend::create_frontend("typescript")
+        .map_err(|e| miette::miette!("{}", e))?;
+    let domain_ir = frontend.parse_directory(domain)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    // Load existing lock file
+    let lock_path = domain.parent().unwrap_or(domain).join("events.lock.json");
+    let existing = SchemaLockFile::load(&lock_path)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    // Check for breaking changes if lock file exists
+    if let Some(ref locked) = existing {
+        let diffs = spite_compiler::schema::diff_schemas(&locked.aggregates, &domain_ir);
+        let breaking = diffs.iter().filter(|d| d.is_breaking()).collect::<Vec<_>>();
+
+        if !breaking.is_empty() && !force {
+            spinner.finish_and_clear();
+            ui::nope_header();
+            println!();
+            println!("  Breaking changes detected:");
+            for diff in &breaking {
+                println!("    {}.{}", diff.aggregate, diff.event);
+                println!("{}", diff.format_changes());
+            }
+            println!();
+            println!("  Use --force to sync anyway (WARNING: may break event replay)");
+            return Err(miette::miette!("Breaking changes detected"));
+        }
+    }
+
+    // Generate and save new lock file
+    let lock = SchemaLockFile::from_domain_ir(&domain_ir, env!("CARGO_PKG_VERSION"));
+    lock.save(&lock_path)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    spinner.finish_and_clear();
+    ui::looking_good();
+    println!();
+    println!("    Schema lock file updated: {}", lock_path.display());
+    println!("    {} aggregates, {} events captured",
+        lock.aggregates.len(),
+        lock.aggregates.values().map(|a| a.events.len()).sum::<usize>()
+    );
+
+    Ok(())
+}
+
+/// Show diff between current code and lock file.
+async fn schema_diff(domain: &PathBuf) -> miette::Result<()> {
+    use spite_compiler::schema::SchemaLockFile;
+
+    let spinner = ui::spinner("Comparing schemas...");
+
+    // Parse domain
+    let mut frontend = spite_compiler::frontend::create_frontend("typescript")
+        .map_err(|e| miette::miette!("{}", e))?;
+    let domain_ir = frontend.parse_directory(domain)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    // Load lock file
+    let lock_path = domain.parent().unwrap_or(domain).join("events.lock.json");
+    let locked = SchemaLockFile::load(&lock_path)
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    spinner.finish_and_clear();
+
+    match locked {
+        None => {
+            println!();
+            println!("  No lock file found at {}", lock_path.display());
+            println!("  Run `spitestack schema sync` to generate one");
+        }
+        Some(locked) => {
+            let diffs = spite_compiler::schema::diff_schemas(&locked.aggregates, &domain_ir);
+
+            if diffs.is_empty() {
+                ui::looking_good();
+                println!();
+                println!("    No schema changes detected");
+            } else {
+                println!();
+                ui::box_header(&format!("{} Schema Changes", ui::symbols::TRIANGLE));
+                ui::box_line("");
+
+                for diff in &diffs {
+                    let marker = if diff.is_breaking() { "BREAKING" } else { "OK" };
+                    ui::box_line(&format!("{}.{} [{}]", diff.aggregate, diff.event, marker));
+                    for line in diff.format_changes().lines() {
+                        ui::box_line(line);
+                    }
+                    ui::box_line("");
+                }
+
+                ui::box_footer();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reset the schema lock file.
+async fn schema_reset(domain: &PathBuf, confirmed: bool) -> miette::Result<()> {
+    let lock_path = domain.parent().unwrap_or(domain).join("events.lock.json");
+
+    if !confirmed {
+        ui::nope_header();
+        println!();
+        println!("  This will delete the schema lock file.");
+        println!("  Existing events in the database may not replay correctly");
+        println!("  after you regenerate the lock file with different schemas.");
+        println!();
+        println!("  If you're sure, run:");
+        println!("    spitestack schema reset --i-know-what-im-doing");
+        return Ok(());
+    }
+
+    if lock_path.exists() {
+        std::fs::remove_file(&lock_path)
+            .map_err(|e| miette::miette!("Failed to delete lock file: {}", e))?;
+
+        println!();
+        println!("  Lock file deleted: {}", lock_path.display());
+        println!("  Run `spitestack schema sync` to generate a new one");
+    } else {
+        println!();
+        println!("  No lock file found at {}", lock_path.display());
+    }
+
+    Ok(())
 }

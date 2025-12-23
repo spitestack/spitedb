@@ -21,7 +21,10 @@ pub fn generate_package_json(name: &str, spitedb_napi_path: Option<&str>) -> Str
     "typecheck": "tsc --noEmit"
   }},
   "dependencies": {{
-    {}
+    {},
+    "@simplewebauthn/server": "^9.0.0",
+    "@simplewebauthn/types": "^9.0.0",
+    "arctic": "^1.9.0"
   }},
   "devDependencies": {{
     "@types/bun": "latest",
@@ -86,6 +89,7 @@ pub fn generate_index_ts(port: u16, app_name: &str) -> String {
         r#"import {{ SpiteDbNapi, TelemetryDbNapi }} from '@spitestack/db';
 import {{ mkdir }} from 'node:fs/promises';
 import {{ createRouter }} from './generated/router';
+import {{ ensureSystemAdmin }} from './generated/runtime/identity';
 
 const eventsDir = './data/events';
 const telemetryDir = './data/telemetry';
@@ -96,7 +100,31 @@ await mkdir(telemetryDir, {{ recursive: true }});
 
 const db = await SpiteDbNapi.open(`${{eventsDir}}/{}.db`);
 const telemetry = await TelemetryDbNapi.open(telemetryDir, {{ appName: '{}' }});
-const router = createRouter({{ db, telemetry, tenant: 'default' }});
+
+const adminEmail = process.env.SYSTEM_ADMIN_EMAIL || (process.env.NODE_ENV === 'production' ? '' : 'admin@local');
+if (!adminEmail) {{
+  throw new Error('SYSTEM_ADMIN_EMAIL is required in production to bootstrap the system admin.');
+}}
+
+const adminBootstrap = await ensureSystemAdmin(db, {{ adminEmail }});
+if (adminBootstrap.created && adminBootstrap.password) {{
+  console.log('🔐 System admin created');
+  console.log(`   Email: ${{adminEmail}}`);
+  console.log(`   One-time password: ${{adminBootstrap.password}}`);
+  console.log('   Change this password on first login.');
+}}
+if (adminBootstrap.systemTenantCreated) {{
+  console.log('🛡️ System tenant initialized');
+}}
+
+// Auth config from environment or default
+const authConfig = {{
+  secret: process.env.AUTH_SECRET || 'dev-secret-do-not-use-in-prod',
+  issuer: process.env.AUTH_ISSUER,
+  audience: process.env.AUTH_AUDIENCE,
+}};
+
+const router = createRouter({{ db, telemetry, authConfig }});
 
 const server = Bun.serve({{
   port: {},
@@ -109,7 +137,7 @@ console.log(`🚀 SpiteStack server running at http://localhost:${{server.port}}
 void telemetry.writeBatch([{{
   tsMs: Date.now(),
   kind: 'Log',
-  tenantId: 'default',
+  tenantId: 'system',
   severity: 1,
   message: 'server.start',
   attrsJson: JSON.stringify({{
@@ -122,7 +150,7 @@ process.on('SIGINT', () => {{
   void telemetry.writeBatch([{{
     tsMs: Date.now(),
     kind: 'Log',
-    tenantId: 'default',
+    tenantId: 'system',
     severity: 1,
     message: 'server.stop',
   }}]).finally(() => process.exit(0));
@@ -168,6 +196,11 @@ bun run build
 bun run start
 ```
 
+## Bootstrap
+
+Set `SYSTEM_ADMIN_EMAIL` to seed a system-tenant admin on first run. A one-time
+password is printed to the console and must be changed on first login.
+
 ## Structure
 
 - `src/index.ts` - Server entry point
@@ -189,8 +222,8 @@ pub fn generate_generated_index(aggregates: &[String], domain_import_path: &str)
 
     // Adjust path: handlers are in generated/handlers/, index is in generated/
     // So we need one less "../" in the path
-    let adjusted_path = if domain_import_path.starts_with("../") {
-        &domain_import_path[3..] // Remove first "../"
+    let adjusted_path = if let Some(stripped) = domain_import_path.strip_prefix("../") {
+        stripped // Remove first "../"
     } else {
         domain_import_path
     };
@@ -209,6 +242,11 @@ pub fn generate_generated_index(aggregates: &[String], domain_import_path: &str)
     }
 
     output.push_str("\nexport * from './router';\n");
+    
+    // Export runtime modules
+    output.push_str("export * from './runtime/client';\n");
+    output.push_str("export * from './runtime/auth';\n");
+    output.push_str("export * from './runtime/identity';\n");
 
     output
 }

@@ -141,12 +141,10 @@ pub fn draw_mini_vinyl_tiered(
         } else {
             symbols::VINYL_FRAMES[vinyl.ascii_frame()]
         }
+    } else if tier.supports_unicode() {
+        syms.record
     } else {
-        if tier.supports_unicode() {
-            syms.record
-        } else {
-            symbols::VINYL
-        }
+        symbols::VINYL
     };
 
     let style = if vinyl.scratching {

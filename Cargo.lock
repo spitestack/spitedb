@@ -1414,6 +1414,9 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "pathdiff",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tree-sitter",
  "tree-sitter-typescript",

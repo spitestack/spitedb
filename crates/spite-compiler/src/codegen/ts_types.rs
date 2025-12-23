@@ -24,7 +24,7 @@ pub fn generate_object_type(obj: &ObjectType) -> String {
     let fields: Vec<String> = obj
         .fields
         .iter()
-        .map(|f| format_field(f))
+        .map(format_field)
         .collect();
 
     format!("{{ {} }}", fields.join("; "))

@@ -46,7 +46,7 @@ pub fn draw_errors(f: &mut Frame, app: &App, theme: &Theme, tier: CapabilityTier
         let items: Vec<ListItem> = app
             .errors
             .iter()
-            .flat_map(|e| error_to_list_items(e, theme, &syms))
+            .flat_map(|e| error_to_list_items(e, theme, syms))
             .collect();
 
         let list = List::new(items).block(block);

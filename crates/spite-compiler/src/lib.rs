@@ -60,6 +60,7 @@ pub mod ir;
 pub mod validate;
 pub mod codegen;
 pub mod diagnostic;
+pub mod schema;
 
 use std::path::PathBuf;
 
@@ -96,22 +97,36 @@ impl Compiler {
     /// This runs the full pipeline:
     /// 1. Create frontend for the configured language
     /// 2. Parse source files into IR
-    /// 3. Validate IR for purity and structure
-    /// 4. Generate TypeScript code
-    /// 5. Write output files
+    /// 3. Parse App configuration from index.ts
+    /// 4. Apply access configuration to IR
+    /// 5. Validate IR for purity and structure
+    /// 6. Generate TypeScript code
+    /// 7. Write output files
     pub async fn compile(&self) -> Result<CompileResult, CompilerError> {
         // Phase 1: Create frontend
         let mut frontend = frontend::create_frontend(&self.config.language)?;
 
         // Phase 2: Parse files into IR
-        let domain_ir = frontend.parse_directory(&self.config.domain_dir)?;
+        let mut domain_ir = frontend.parse_directory(&self.config.domain_dir)?;
 
-        // Phase 3: Validate
+        // Phase 3: Parse App configuration from index.ts
+        let app_config = frontend::typescript::app_parser::parse_app_config(&self.config.domain_dir)?;
+
+        // Phase 4: Apply access configuration
+        if let Some(ref config) = app_config {
+            frontend::typescript::to_ir::apply_access_config(&mut domain_ir, config);
+            domain_ir.app_config = Some(config.clone());
+        }
+
+        // Phase 5: Schema evolution check (production mode only)
+        self.check_schema_evolution(&domain_ir, &app_config)?;
+
+        // Phase 6: Validate
         if !self.config.skip_purity_check {
             validate::validate_domain(&domain_ir)?;
         }
 
-        // Phase 4: Generate TypeScript code
+        // Phase 7: Generate TypeScript code
         // Compute import path from handlers/ to domain source
         let domain_import_path = self.compute_domain_import_path()?;
         let generated = codegen::generate(&domain_ir, &domain_import_path)?;
@@ -135,6 +150,173 @@ impl Compiler {
         let mut frontend = frontend::create_frontend(&self.config.language)?;
         let domain_ir = frontend.parse_directory(&self.config.domain_dir)?;
         validate::validate_domain(&domain_ir)?;
+        Ok(())
+    }
+
+    /// Check schema evolution in production mode.
+    ///
+    /// In production mode:
+    /// - Loads the existing events.lock.json file
+    /// - Compares current schemas against the lock file
+    /// - Rejects breaking changes with helpful errors
+    /// - Allows non-breaking changes (logged as warnings)
+    /// - If no lock file exists, generates one
+    fn check_schema_evolution(
+        &self,
+        domain: &ir::DomainIR,
+        app_config: &Option<ir::AppConfig>,
+    ) -> Result<(), CompilerError> {
+        use ir::AppMode;
+
+        // Only check in production mode
+        let mode = app_config
+            .as_ref()
+            .map(|c| c.mode)
+            .unwrap_or(AppMode::Greenfield);
+
+        if mode != AppMode::Production {
+            return Ok(());
+        }
+
+        // Lock file is at project root (parent of domain dir typically)
+        let lock_path = self.config.domain_dir.parent()
+            .unwrap_or(&self.config.domain_dir)
+            .join("events.lock.json");
+
+        // Load existing lock file
+        let existing_lock = schema::SchemaLockFile::load(&lock_path)?;
+
+        match existing_lock {
+            None => {
+                // No lock file exists - generate initial one
+                let lock = schema::SchemaLockFile::from_domain_ir(domain, env!("CARGO_PKG_VERSION"));
+                lock.save(&lock_path)?;
+                eprintln!(
+                    "📋 Generated initial schema lock file: {}",
+                    lock_path.display()
+                );
+                Ok(())
+            }
+            Some(locked) => {
+                // Compare schemas
+                let diffs = schema::diff_schemas(&locked.aggregates, domain);
+
+                if diffs.is_empty() {
+                    // No changes - all good
+                    return Ok(());
+                }
+
+                // Check for breaking changes
+                let breaking_diffs: Vec<_> = diffs.iter().filter(|d| d.is_breaking()).collect();
+
+                if !breaking_diffs.is_empty() {
+                    // Report the first breaking change (could report all, but one is clearer)
+                    let first = &breaking_diffs[0];
+                    return Err(CompilerError::BreakingSchemaChange {
+                        aggregate: first.aggregate.clone(),
+                        event: first.event.clone(),
+                        changes: first.format_changes(),
+                    });
+                }
+
+                // Non-breaking changes - update lock file and generate upcasts
+                let non_breaking: Vec<_> = diffs.iter().filter(|d| d.can_auto_upcast()).collect();
+                if !non_breaking.is_empty() {
+                    eprintln!("📝 Non-breaking schema changes detected:");
+                    for diff in &non_breaking {
+                        eprintln!("   {}.{}", diff.aggregate, diff.event);
+                        eprintln!("{}", diff.format_changes());
+                    }
+
+                    // Generate upcast files for aggregates with changes
+                    self.generate_upcasts(&diffs, &locked)?;
+
+                    // Update the lock file with new versions
+                    let updated_lock = schema::SchemaLockFile::from_domain_ir(domain, env!("CARGO_PKG_VERSION"));
+                    updated_lock.save(&lock_path)?;
+                    eprintln!("   Updated events.lock.json with new schema versions");
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    /// Generate upcast TypeScript files for schema changes.
+    fn generate_upcasts(
+        &self,
+        diffs: &[schema::SchemaDiff],
+        locked: &schema::SchemaLockFile,
+    ) -> Result<(), CompilerError> {
+        use std::collections::HashMap;
+
+        // Group diffs by aggregate
+        let mut by_aggregate: HashMap<&str, Vec<&schema::SchemaDiff>> = HashMap::new();
+        for diff in diffs {
+            if diff.can_auto_upcast() {
+                by_aggregate
+                    .entry(&diff.aggregate)
+                    .or_default()
+                    .push(diff);
+            }
+        }
+
+        if by_aggregate.is_empty() {
+            return Ok(());
+        }
+
+        // Create upcasts directory
+        let upcasts_dir = self.config.out_dir.join("src").join("generated").join("upcasts");
+        std::fs::create_dir_all(&upcasts_dir).map_err(|e| CompilerError::IoError {
+            path: upcasts_dir.clone(),
+            message: e.to_string(),
+        })?;
+
+        // Generate upcast file for each aggregate with changes
+        for (aggregate_name, aggregate_diffs) in by_aggregate {
+            // Get current versions from the locked schema
+            let current_versions: HashMap<String, u32> = locked
+                .aggregates
+                .get(aggregate_name)
+                .map(|agg| {
+                    agg.events
+                        .iter()
+                        .map(|(name, schema)| (name.clone(), schema.version + 1))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let code = schema::UpcastGenerator::generate_upcast_module(
+                aggregate_name,
+                aggregate_diffs
+                    .iter()
+                    .map(|d| (*d).clone())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                &current_versions,
+            );
+
+            let snake_name = aggregate_name
+                .chars()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    if c.is_uppercase() && i > 0 {
+                        vec!['_', c.to_lowercase().next().unwrap()]
+                    } else {
+                        vec![c.to_lowercase().next().unwrap()]
+                    }
+                })
+                .collect::<String>();
+
+            let file_path = upcasts_dir.join(format!("{}.upcast.ts", snake_name));
+            std::fs::write(&file_path, code).map_err(|e| CompilerError::IoError {
+                path: file_path.clone(),
+                message: e.to_string(),
+            })?;
+
+            eprintln!("   Generated upcast file: {}", file_path.display());
+        }
+
         Ok(())
     }
 

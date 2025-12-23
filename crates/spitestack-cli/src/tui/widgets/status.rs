@@ -41,12 +41,10 @@ pub fn draw_status(f: &mut Frame, app: &App, theme: &Theme, tier: CapabilityTier
         } else {
             symbols::VINYL_FRAMES[app.vinyl.frame % 4]
         }
+    } else if tier.supports_unicode() {
+        syms.record
     } else {
-        if tier.supports_unicode() {
-            syms.record
-        } else {
-            symbols::VINYL
-        }
+        symbols::VINYL
     };
 
     let vinyl_style = if app.vinyl.scratching {

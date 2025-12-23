@@ -470,21 +470,12 @@ impl VinylState {
 }
 
 /// State for the full-screen music mode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MusicModeState {
     /// Currently selected link (0 = Spotify, 1 = Apple Music)
     pub selected_link: usize,
     /// Playlist URLs
     pub playlist_urls: PlaylistLinks,
-}
-
-impl Default for MusicModeState {
-    fn default() -> Self {
-        Self {
-            selected_link: 0,
-            playlist_urls: PlaylistLinks::default(),
-        }
-    }
 }
 
 /// Links to curated playlists.

@@ -32,8 +32,6 @@
  * - **Auto-recovery**: Workers restart on crash with exponential backoff
  */
 
-/// <reference types="bun-types" />
-
 import { Worker } from 'worker_threads';
 import type { ProjectionModule } from './define';
 

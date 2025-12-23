@@ -1,7 +1,7 @@
 //! Aggregate intermediate representation.
 
 use std::path::PathBuf;
-use super::{DomainType, ObjectType, ParameterIR, InitialValue};
+use super::{AccessLevel, DomainType, ObjectType, ParameterIR, InitialValue};
 
 /// IR representation of an aggregate.
 #[derive(Debug)]
@@ -67,6 +67,13 @@ pub struct CommandIR {
 
     /// The body statements (for translation to Rust).
     pub body: Vec<StatementIR>,
+
+    /// Access level for this command endpoint.
+    pub access: AccessLevel,
+
+    /// Required roles to access this command.
+    /// Only applicable for `Internal` and `Private` access levels.
+    pub roles: Vec<String>,
 }
 
 /// IR representation of a statement.

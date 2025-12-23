@@ -1,5 +1,6 @@
 //! TypeScript frontend for the SpiteStack compiler.
 
+pub mod app_parser;
 pub mod ast;
 pub mod parser;
 pub mod to_ir;

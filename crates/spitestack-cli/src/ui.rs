@@ -254,12 +254,11 @@ pub fn box_header(title: &str) {
     let dashes = width - title_len - 4;
 
     println!(
-        "  {}{}{}{}{}",
+        "  {}{}{}{}",
         style("\u{256D}\u{2500}").fg(colors::CYAN), // ╭─
         style(title_padded).fg(colors::CYAN).bold(),
         style("\u{2500}".repeat(dashes)).fg(colors::CYAN),
-        style("\u{256E}").fg(colors::CYAN), // ╮
-        ""
+        style("\u{256E}").fg(colors::CYAN) // ╮
     );
 }
 

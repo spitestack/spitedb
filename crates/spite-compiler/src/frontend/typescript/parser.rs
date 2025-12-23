@@ -158,7 +158,7 @@ impl<'a> Visitor<'a> {
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();
 
-        if children.len() >= 1 {
+        if !children.is_empty() {
             name = self.node_text(children[0]).to_string();
         }
         if children.len() >= 3 {
@@ -445,7 +445,7 @@ impl<'a> Visitor<'a> {
                 }
                 _ => {
                     // Capture initializer as raw text
-                    if name.is_empty() == false && initializer.is_none() && child.kind() != "=" {
+                    if !name.is_empty() && initializer.is_none() && child.kind() != "=" {
                         initializer = Some(self.node_text(child).to_string());
                     }
                 }
