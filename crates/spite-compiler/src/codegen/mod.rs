@@ -5,6 +5,7 @@
 //! - Handlers (HTTP handlers that wire aggregates to SpiteDB)
 //! - Router (Bun.serve routing)
 //! - Runtime modules (auth, utilities, etc.)
+//! - Projections (SQLite-backed read models with Bun workers)
 //!
 //! User's source files (events.ts, state.ts, aggregate.ts) are NOT regenerated -
 //! we import them directly from the domain folder.
@@ -15,6 +16,7 @@ mod handlers;
 mod router;
 mod orchestrator;
 mod runtime;
+mod projection;
 pub mod project;
 
 use crate::diagnostic::CompilerError;
@@ -65,6 +67,10 @@ pub fn generate(domain: &DomainIR, domain_import_path: &str) -> Result<Generated
             orchestrator_code,
         ));
     }
+
+    // Generate projections (SQLite-backed read models with Bun workers)
+    let projection_files = projection::generate_projections(domain, domain_import_path);
+    files.extend(projection_files);
 
     // Generate router
     let router_code = router::generate_router(domain);

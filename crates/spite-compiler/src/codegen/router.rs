@@ -39,6 +39,25 @@ pub fn generate_router(domain: &DomainIR) -> String {
         ));
     }
 
+    // Import handlers for each projection
+    for projection in &domain.projections {
+        let snake_name = to_snake_case(&projection.name);
+
+        let handler_names: Vec<String> = projection
+            .queries
+            .iter()
+            .map(|q| format!("handle{}{}", projection.name, to_pascal_case(&q.name)))
+            .collect();
+
+        if !handler_names.is_empty() {
+            output.push_str(&format!(
+                "import {{ {} }} from './handlers/{}.projection';\n",
+                handler_names.join(", "),
+                snake_name
+            ));
+        }
+    }
+
     output.push('\n');
 
     // Router context type
@@ -368,6 +387,116 @@ pub fn generate_router(domain: &DomainIR) -> String {
             ));
             output.push_str("          return finalize(response);\n");
             output.push_str("        }\n");
+        }
+
+        output.push_str("      }\n\n");
+    }
+
+    // Generate route matching for projections (read models)
+    if !domain.projections.is_empty() {
+        output.push_str("      // Projection routes (read models)\n");
+        output.push_str("      if (method === 'GET' && path.startsWith('/projections/')) {\n");
+        output.push_str("        const projParts = path.slice('/projections/'.length).split('/');\n");
+        output.push_str("        const projName = projParts[0];\n");
+        output.push_str("        const queryName = projParts[1];\n\n");
+
+        for projection in &domain.projections {
+            let snake_name = to_snake_case(&projection.name);
+
+            output.push_str(&format!("        if (projName === '{}') {{\n", snake_name));
+
+            // Generate access control for the projection
+            match projection.access {
+                AccessLevel::Public => {
+                    output.push_str("          // Public projection - no auth required\n");
+                    output.push_str("          const { traceId, spanId, finalize: projFinalize } = createFinalize('public', authResult.ok ? authResult.user : undefined);\n");
+                    output.push_str("          const projCtx = { tenant: 'public', telemetry: ctx.telemetry };\n");
+                }
+                AccessLevel::Internal => {
+                    output.push_str("          // Internal projection - requires system tenant membership\n");
+                    output.push_str("          const accessErr = checkInternal();\n");
+                    output.push_str("          if (accessErr) return accessErr;\n");
+                    if !projection.roles.is_empty() {
+                        let roles_str = projection.roles.iter().map(|r| format!("'{}'", r)).collect::<Vec<_>>().join(", ");
+                        output.push_str(&format!("          const roleErr = checkRoles(authResult.user, SYSTEM_TENANT_ID, [{}]);\n", roles_str));
+                        output.push_str("          if (roleErr) return roleErr;\n");
+                    }
+                    output.push_str("          const { traceId, spanId, finalize: projFinalize } = createFinalize(SYSTEM_TENANT_ID, authResult.user);\n");
+                    output.push_str("          const projCtx = { tenant: SYSTEM_TENANT_ID, telemetry: ctx.telemetry };\n");
+                }
+                AccessLevel::Private => {
+                    output.push_str("          // Private projection - requires auth + tenant\n");
+                    output.push_str("          const privateResult = checkPrivate();\n");
+                    output.push_str("          if ('error' in privateResult) return privateResult.error;\n");
+                    output.push_str("          const projUser = privateResult.user;\n");
+                    output.push_str("          const projTenant = privateResult.tenant;\n");
+                    if !projection.roles.is_empty() {
+                        let roles_str = projection.roles.iter().map(|r| format!("'{}'", r)).collect::<Vec<_>>().join(", ");
+                        output.push_str(&format!("          const roleErr = checkRoles(projUser, projTenant, [{}]);\n", roles_str));
+                        output.push_str("          if (roleErr) return roleErr;\n");
+                    }
+                    output.push_str("          const { traceId, spanId, finalize: projFinalize } = createFinalize(projTenant, projUser);\n");
+                    output.push_str("          const projCtx = { tenant: projTenant, telemetry: ctx.telemetry };\n");
+                }
+            }
+
+            // Generate route matching for each query method
+            for query in &projection.queries {
+                let query_snake = to_snake_case(&query.name);
+
+                if query.is_range_query {
+                    // Range query - parameters come from query string
+                    output.push_str(&format!("          if (queryName === '{}') {{\n", query_snake));
+                    output.push_str("            const params = Object.fromEntries(url.searchParams);\n");
+                    output.push_str(&format!(
+                        "            const response = await handle{}{}(projCtx, {{ ...params }});\n",
+                        projection.name,
+                        to_pascal_case(&query.name)
+                    ));
+                    output.push_str("            return projFinalize(response);\n");
+                    output.push_str("          }\n");
+                } else if query.parameters.is_empty() {
+                    // No parameters - simple GET
+                    output.push_str(&format!("          if (queryName === '{}') {{\n", query_snake));
+                    output.push_str(&format!(
+                        "            const response = await handle{}{}(projCtx);\n",
+                        projection.name,
+                        to_pascal_case(&query.name)
+                    ));
+                    output.push_str("            return projFinalize(response);\n");
+                    output.push_str("          }\n");
+                } else {
+                    // Point query - parameters from URL path or query string
+                    output.push_str(&format!("          if (queryName === '{}') {{\n", query_snake));
+
+                    // Extract parameters - support both path params and query params
+                    let param_names: Vec<_> = query.parameters.iter().map(|p| p.name.clone()).collect();
+                    if param_names.len() == 1 {
+                        // Single param - take from path (e.g., /projections/user_profile/get_by_id/user123)
+                        output.push_str("            const paramValue = projParts[2] ?? url.searchParams.get('");
+                        output.push_str(&param_names[0]);
+                        output.push_str("');\n");
+                        output.push_str(&format!(
+                            "            const response = await handle{}{}(projCtx, {{ {}: paramValue }});\n",
+                            projection.name,
+                            to_pascal_case(&query.name),
+                            param_names[0]
+                        ));
+                    } else {
+                        // Multiple params - from query string
+                        output.push_str("            const params = Object.fromEntries(url.searchParams);\n");
+                        output.push_str(&format!(
+                            "            const response = await handle{}{}(projCtx, params);\n",
+                            projection.name,
+                            to_pascal_case(&query.name)
+                        ));
+                    }
+                    output.push_str("            return projFinalize(response);\n");
+                    output.push_str("          }\n");
+                }
+            }
+
+            output.push_str("        }\n\n");
         }
 
         output.push_str("      }\n\n");

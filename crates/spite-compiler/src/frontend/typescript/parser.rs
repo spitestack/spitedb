@@ -291,13 +291,32 @@ impl<'a> Visitor<'a> {
             }
             "object_type" => {
                 let mut properties = Vec::new();
+                let mut index_signature = None;
                 let mut cursor = node.walk();
 
                 for child in node.children(&mut cursor) {
-                    if child.kind() == "property_signature" {
-                        if let Some(prop) = self.visit_property_signature(child)? {
-                            properties.push(prop);
+                    match child.kind() {
+                        "property_signature" => {
+                            if let Some(prop) = self.visit_property_signature(child)? {
+                                properties.push(prop);
+                            }
                         }
+                        "index_signature" => {
+                            // Parse { [key: KeyType]: ValueType }
+                            index_signature = self.visit_index_signature(child)?;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // If we have an index signature and no other properties, return IndexSignature
+                if let Some((key_name, key_type, value_type)) = index_signature {
+                    if properties.is_empty() {
+                        return Ok(TypeNode::IndexSignature {
+                            key_name,
+                            key_type: Box::new(key_type),
+                            value_type: Box::new(value_type),
+                        });
                     }
                 }
 
@@ -360,6 +379,60 @@ impl<'a> Visitor<'a> {
             type_node,
             optional,
         }))
+    }
+
+    /// Parse an index signature: [key: KeyType]: ValueType
+    fn visit_index_signature(&self, node: Node) -> Result<Option<(String, TypeNode, TypeNode)>, CompilerError> {
+        let mut key_name = String::new();
+        let mut key_type = TypeNode::Primitive("string".to_string());
+        let mut value_type = TypeNode::Primitive("unknown".to_string());
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "index_type_query" | "identifier" => {
+                    // The key name (e.g., "userId" in [userId: string])
+                    if key_name.is_empty() {
+                        key_name = self.node_text(child).to_string();
+                    }
+                }
+                "type_annotation" => {
+                    // This is the value type annotation (after the colon outside brackets)
+                    let mut inner_cursor = child.walk();
+                    for inner_child in child.children(&mut inner_cursor) {
+                        if inner_child.kind() != ":" {
+                            value_type = self.visit_type_node(inner_child)?;
+                            break;
+                        }
+                    }
+                }
+                // Handle the key type inside the brackets [key: string]
+                "predefined_type" | "type_identifier" => {
+                    // If we already have a key name, this is the key type
+                    if !key_name.is_empty() {
+                        key_type = self.visit_type_node(child)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // If we couldn't extract a key name, try to get it from the raw text
+        if key_name.is_empty() {
+            let text = self.node_text(node);
+            // Try to extract from [keyName: ...
+            if let Some(start) = text.find('[') {
+                if let Some(colon) = text.find(':') {
+                    key_name = text[start + 1..colon].trim().to_string();
+                }
+            }
+        }
+
+        if key_name.is_empty() {
+            key_name = "key".to_string(); // Default fallback
+        }
+
+        Ok(Some((key_name, key_type, value_type)))
     }
 
     fn visit_class(&mut self, node: Node, exported: bool) -> Result<Option<ClassDecl>, CompilerError> {

@@ -69,6 +69,16 @@ pub enum CompilerError {
         type_name: String,
     },
 
+    #[error("Invalid projection '{name}': {reason}")]
+    #[diagnostic(
+        code(spitestack::structure::invalid_projection),
+        help("Projections must have a build(event) method and a state property with type annotation")
+    )]
+    InvalidProjection {
+        name: String,
+        reason: String,
+    },
+
     // =========================================================================
     // Purity Errors
     // =========================================================================

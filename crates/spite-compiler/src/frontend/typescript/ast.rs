@@ -51,6 +51,16 @@ pub enum TypeNode {
     /// { type: "Foo", field: T }
     ObjectLiteral(Vec<ObjectProperty>),
 
+    /// { [key: string]: T } - index signature
+    IndexSignature {
+        /// The key name (e.g., "userId", "date")
+        key_name: String,
+        /// The key type (usually string)
+        key_type: Box<TypeNode>,
+        /// The value type
+        value_type: Box<TypeNode>,
+    },
+
     /// Reference to another type
     Reference(String),
 

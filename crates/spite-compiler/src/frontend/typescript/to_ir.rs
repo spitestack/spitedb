@@ -6,6 +6,11 @@ use crate::ir::{
     AggregateIR, CommandIR, DomainIR, DomainType, EventTypeIR, EventVariant, EventField,
     FieldDef, InitialValue, ObjectType, ParameterIR,
     StatementIR, ExpressionIR, BinaryOp, UnaryOp,
+    // Projection types
+    ProjectionIR, ProjectionKind, ProjectionSchema, QueryMethodIR,
+    SubscribedEvent, ColumnDef, IndexDef, SqlType, StateShape, TimeSeriesSignals,
+    is_time_related_name, is_range_param,
+    TIMESTAMP_FIELDS, TIME_STRING_METHODS,
 };
 use super::ast::*;
 
@@ -26,17 +31,21 @@ pub fn to_ir(files: &[ParsedFile], source_dir: PathBuf) -> Result<DomainIR, Comp
         .filter(|t| t.name.ends_with("State"))
         .collect();
 
-    // Find aggregate classes across all files
+    // Find aggregate and projection classes across all files
     for file in files {
         for class in &file.classes {
             if is_aggregate(class) {
                 let aggregate = convert_aggregate(class, &all_event_types, &all_state_types, &file.path)?;
                 domain.aggregates.push(aggregate);
+            } else if is_projection(class) {
+                let projection = convert_projection(class, &all_event_types, &file.path)?;
+                domain.projections.push(projection);
             }
         }
     }
 
-    if domain.aggregates.is_empty() {
+    // Only require aggregates if no projections are found either
+    if domain.aggregates.is_empty() && domain.projections.is_empty() {
         return Err(CompilerError::NoAggregates);
     }
 
@@ -239,6 +248,11 @@ fn convert_type_node(node: &TypeNode) -> DomainType {
                 })
                 .collect();
             DomainType::Object(ObjectType { fields })
+        }
+        TypeNode::IndexSignature { value_type, .. } => {
+            // For index signatures, represent as an object with the value type
+            // This is a simplification - the key is handled separately in projection detection
+            convert_type_node(value_type)
         }
         TypeNode::Union(members) => {
             // Check if it's T | undefined (optional)
@@ -637,4 +651,475 @@ pub fn apply_access_config(domain: &mut DomainIR, app_config: &crate::ir::AppCon
             cmd.roles = method_config.roles;
         }
     }
+}
+
+// ============================================================================
+// Projection Detection and Conversion
+// ============================================================================
+
+/// Checks if a class is a projection.
+/// A projection has a build() method and a state property with index signature or object type.
+fn is_projection(class: &ClassDecl) -> bool {
+    let has_build = class.methods.iter().any(|m| m.name == "build");
+    let has_state_property = class.properties.iter().any(|p| {
+        // Look for properties with index signature or object type annotation
+        if let Some(ref type_node) = p.type_node {
+            matches!(type_node, TypeNode::IndexSignature { .. } | TypeNode::ObjectLiteral(_))
+        } else {
+            false
+        }
+    });
+
+    has_build && has_state_property
+}
+
+/// Converts a class declaration to a ProjectionIR.
+fn convert_projection(
+    class: &ClassDecl,
+    event_types: &[&TypeAlias],
+    source_path: &Path,
+) -> Result<ProjectionIR, CompilerError> {
+    let name = class.name.clone();
+
+    // Find the state property (first property with index signature or object type)
+    let state_prop = class.properties.iter().find(|p| {
+        if let Some(ref type_node) = p.type_node {
+            matches!(type_node, TypeNode::IndexSignature { .. } | TypeNode::ObjectLiteral(_))
+        } else {
+            false
+        }
+    }).ok_or_else(|| CompilerError::InvalidProjection {
+        name: name.clone(),
+        reason: "Missing state property with type annotation".to_string(),
+    })?;
+
+    // Analyze state shape and determine projection kind
+    let state_type = state_prop.type_node.as_ref().unwrap();
+    let state_shape = analyze_state_shape(state_type);
+    let time_signals = detect_time_series_signals(class, &state_shape);
+    let kind = determine_projection_kind(&state_shape, &time_signals);
+
+    // Extract subscribed events from build method parameter
+    let subscribed_events = extract_subscribed_events(class, event_types);
+
+    // Extract schema from state type
+    let schema = extract_projection_schema(state_prop, state_type, class)?;
+
+    // Extract query methods (public methods except build, constructor)
+    let queries = extract_query_methods(class);
+
+    // Get raw build body
+    let raw_build_body = class
+        .methods
+        .iter()
+        .find(|m| m.name == "build")
+        .and_then(|m| m.raw_body.clone());
+
+    Ok(ProjectionIR {
+        name,
+        source_path: source_path.to_path_buf(),
+        kind,
+        subscribed_events,
+        schema,
+        queries,
+        raw_build_body,
+        access: crate::ir::AccessLevel::Internal,
+        roles: Vec::new(),
+    })
+}
+
+/// Analyzes the state type to determine its shape.
+fn analyze_state_shape(type_node: &TypeNode) -> StateShape {
+    match type_node {
+        TypeNode::IndexSignature { key_name, value_type, .. } => {
+            // Check if value is an object or a number
+            match value_type.as_ref() {
+                TypeNode::Primitive(p) if p == "number" => {
+                    StateShape::IndexedNumber {
+                        key_name: key_name.clone(),
+                    }
+                }
+                TypeNode::ObjectLiteral(_) | TypeNode::Reference(_) => {
+                    StateShape::IndexedObject {
+                        key_name: key_name.clone(),
+                        value_type: convert_type_node(value_type),
+                    }
+                }
+                _ => {
+                    // Default to indexed object for other types
+                    StateShape::IndexedObject {
+                        key_name: key_name.clone(),
+                        value_type: convert_type_node(value_type),
+                    }
+                }
+            }
+        }
+        TypeNode::ObjectLiteral(props) => {
+            let fields = props
+                .iter()
+                .map(|p| (p.name.clone(), convert_type_node(&p.type_node)))
+                .collect();
+            StateShape::NamedFields { fields }
+        }
+        _ => {
+            // Fallback to named fields with empty list
+            StateShape::NamedFields { fields: Vec::new() }
+        }
+    }
+}
+
+/// Detects time-series signals from the class.
+fn detect_time_series_signals(class: &ClassDecl, state_shape: &StateShape) -> TimeSeriesSignals {
+    let mut signals = TimeSeriesSignals::default();
+
+    // Signal 1: Key derived from timestamp in build() method
+    signals.has_timestamp_derivation = has_timestamp_derived_key(class);
+
+    // Signal 2: Key name is time-related (only for indexed number shapes)
+    if let StateShape::IndexedNumber { key_name } = state_shape {
+        signals.has_time_related_key_name = is_time_related_name(key_name);
+    }
+
+    // Signal 3: Has range query methods
+    signals.has_range_query_methods = has_range_query_methods(class);
+
+    signals
+}
+
+/// Determines the projection kind based on state shape and time signals.
+fn determine_projection_kind(state_shape: &StateShape, time_signals: &TimeSeriesSignals) -> ProjectionKind {
+    match state_shape {
+        StateShape::IndexedObject { .. } => ProjectionKind::DenormalizedView,
+        StateShape::IndexedNumber { .. } => {
+            if time_signals.any() {
+                ProjectionKind::TimeSeries
+            } else {
+                ProjectionKind::Aggregator
+            }
+        }
+        StateShape::NamedFields { .. } => ProjectionKind::Aggregator,
+    }
+}
+
+/// Detects if the key in build() is derived from a timestamp field.
+fn has_timestamp_derived_key(class: &ClassDecl) -> bool {
+    let build_method = match class.methods.iter().find(|m| m.name == "build") {
+        Some(m) => m,
+        None => return false,
+    };
+
+    // Look for variable declarations with timestamp derivation patterns
+    for stmt in &build_method.body {
+        if let Statement::VariableDecl { initializer: Some(init), .. } = stmt {
+            if is_timestamp_derivation(init) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks if an expression is a timestamp derivation pattern.
+fn is_timestamp_derivation(expr: &Expression) -> bool {
+    // Pattern: event.timestamp.slice(...) or event.date.toISOString()
+    if let Expression::Call { callee, .. } = expr {
+        if let Expression::MemberAccess { object, property, .. } = callee.as_ref() {
+            // Check if it's a string method (slice, substring, toISOString, etc.)
+            let is_string_method = TIME_STRING_METHODS.iter()
+                .any(|m| property.to_lowercase().contains(&m.to_lowercase()));
+
+            if is_string_method {
+                // Check if the object is accessing a timestamp field
+                if let Expression::MemberAccess { property: inner_prop, .. } = object.as_ref() {
+                    return TIMESTAMP_FIELDS.iter()
+                        .any(|f| inner_prop.to_lowercase().contains(&f.to_lowercase()));
+                }
+                // Could be chained like event.date.toISOString().slice(...)
+                if let Expression::Call { callee: inner_callee, .. } = object.as_ref() {
+                    if let Expression::MemberAccess { object: inner_obj, property: inner_prop, .. } = inner_callee.as_ref() {
+                        let is_iso_string = inner_prop.to_lowercase() == "toisostring";
+                        if is_iso_string {
+                            if let Expression::MemberAccess { property: field_prop, .. } = inner_obj.as_ref() {
+                                return TIMESTAMP_FIELDS.iter()
+                                    .any(|f| field_prop.to_lowercase().contains(&f.to_lowercase()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks if the class has range query methods.
+fn has_range_query_methods(class: &ClassDecl) -> bool {
+    class.methods.iter().any(|m| {
+        m.visibility == Visibility::Public &&
+        m.name != "build" &&
+        m.name != "constructor" &&
+        m.parameters.iter().any(|p| is_range_param(&p.name))
+    })
+}
+
+/// Extracts subscribed events from build method parameter.
+fn extract_subscribed_events(class: &ClassDecl, _event_types: &[&TypeAlias]) -> Vec<SubscribedEvent> {
+    let build_method = match class.methods.iter().find(|m| m.name == "build") {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    // Get the first parameter's type (the event union)
+    let event_param = match build_method.parameters.first() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let type_node = match &event_param.type_node {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    // Extract event names from union type
+    let event_names = extract_event_names_from_type(type_node);
+
+    event_names
+        .into_iter()
+        .map(|name| {
+            // Try to infer aggregate from event name (e.g., "UserCreated" -> "User")
+            let aggregate = infer_aggregate_from_event(&name);
+            SubscribedEvent {
+                event_name: name,
+                aggregate,
+            }
+        })
+        .collect()
+}
+
+/// Extracts event type names from a type node.
+fn extract_event_names_from_type(type_node: &TypeNode) -> Vec<String> {
+    match type_node {
+        TypeNode::Union(members) => {
+            members
+                .iter()
+                .flat_map(|m| extract_event_names_from_type(m))
+                .collect()
+        }
+        TypeNode::Reference(name) => vec![name.clone()],
+        TypeNode::ObjectLiteral(props) => {
+            // Try to extract event name from type field
+            props
+                .iter()
+                .find(|p| p.name == "type")
+                .map(|p| {
+                    if let TypeNode::Primitive(s) = &p.type_node {
+                        s.trim_matches('"').trim_matches('\'').to_string()
+                    } else {
+                        String::new()
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Infers the aggregate name from an event name.
+fn infer_aggregate_from_event(event_name: &str) -> Option<String> {
+    // Common event name patterns: UserCreated, OrderCompleted, etc.
+    // Try to extract the entity name
+    let suffixes = ["Created", "Updated", "Deleted", "Completed", "Cancelled", "Added", "Removed", "Changed"];
+    for suffix in suffixes {
+        if event_name.ends_with(suffix) {
+            return Some(event_name[..event_name.len() - suffix.len()].to_string());
+        }
+    }
+    None
+}
+
+/// Extracts projection schema from state property.
+fn extract_projection_schema(
+    state_prop: &PropertyDecl,
+    state_type: &TypeNode,
+    class: &ClassDecl,
+) -> Result<ProjectionSchema, CompilerError> {
+    let state_property_name = state_prop.name.clone();
+
+    let (primary_keys, columns) = match state_type {
+        TypeNode::IndexSignature { key_name, value_type, .. } => {
+            // Primary key is the index key
+            let pk = ColumnDef {
+                name: to_snake_case(key_name),
+                sql_type: SqlType::Text,
+                nullable: false,
+                default: None,
+            };
+
+            // Columns from value type
+            let cols = extract_columns_from_type(value_type);
+
+            (vec![pk], cols)
+        }
+        TypeNode::ObjectLiteral(props) => {
+            // For aggregators with named fields, use a singleton key
+            let pk = ColumnDef {
+                name: "id".to_string(),
+                sql_type: SqlType::Text,
+                nullable: false,
+                default: Some("'singleton'".to_string()),
+            };
+
+            let cols: Vec<ColumnDef> = props
+                .iter()
+                .map(|p| ColumnDef {
+                    name: to_snake_case(&p.name),
+                    sql_type: SqlType::from_domain_type(&convert_type_node(&p.type_node)),
+                    nullable: p.optional,
+                    default: None,
+                })
+                .collect();
+
+            (vec![pk], cols)
+        }
+        _ => {
+            return Err(CompilerError::InvalidProjection {
+                name: state_prop.name.clone(),
+                reason: "Unsupported state type shape".to_string(),
+            });
+        }
+    };
+
+    // Derive indexes from query method parameters
+    let indexes = derive_indexes_from_queries(class, &columns);
+
+    Ok(ProjectionSchema {
+        state_property_name,
+        primary_keys,
+        columns,
+        indexes,
+    })
+}
+
+/// Extracts column definitions from a type node.
+fn extract_columns_from_type(type_node: &TypeNode) -> Vec<ColumnDef> {
+    match type_node {
+        TypeNode::ObjectLiteral(props) => {
+            props
+                .iter()
+                .map(|p| ColumnDef {
+                    name: to_snake_case(&p.name),
+                    sql_type: SqlType::from_domain_type(&convert_type_node(&p.type_node)),
+                    nullable: p.optional,
+                    default: None,
+                })
+                .collect()
+        }
+        TypeNode::Primitive(p) if p == "number" => {
+            // For { [key]: number } - just a value column
+            vec![ColumnDef {
+                name: "value".to_string(),
+                sql_type: SqlType::Real,
+                nullable: false,
+                default: None,
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Derives indexes from query method parameters.
+fn derive_indexes_from_queries(class: &ClassDecl, columns: &[ColumnDef]) -> Vec<IndexDef> {
+    let mut indexes = Vec::new();
+    let column_names: Vec<_> = columns.iter().map(|c| c.name.clone()).collect();
+
+    for method in &class.methods {
+        if method.visibility != Visibility::Public
+            || method.name == "build"
+            || method.name == "constructor"
+        {
+            continue;
+        }
+
+        for param in &method.parameters {
+            let param_snake = to_snake_case(&param.name);
+            if column_names.contains(&param_snake) {
+                // Check if we already have this index
+                if !indexes.iter().any(|idx: &IndexDef| idx.columns == vec![param_snake.clone()]) {
+                    indexes.push(IndexDef {
+                        name: format!("idx_{}", param_snake),
+                        columns: vec![param_snake],
+                        unique: false,
+                    });
+                }
+            }
+        }
+    }
+
+    indexes
+}
+
+/// Extracts query methods from a class.
+fn extract_query_methods(class: &ClassDecl) -> Vec<QueryMethodIR> {
+    class
+        .methods
+        .iter()
+        .filter(|m| {
+            m.visibility == Visibility::Public
+                && m.name != "build"
+                && m.name != "constructor"
+                && !m.name.starts_with("get_")
+                && !m.name.starts_with("set_")
+        })
+        .map(|m| {
+            let parameters = m
+                .parameters
+                .iter()
+                .map(|p| ParameterIR {
+                    name: p.name.clone(),
+                    typ: p
+                        .type_node
+                        .as_ref()
+                        .map(convert_type_node)
+                        .unwrap_or(DomainType::String),
+                })
+                .collect();
+
+            let return_type = m.return_type.as_ref().map(convert_type_node);
+
+            let indexed_columns: Vec<String> = m
+                .parameters
+                .iter()
+                .map(|p| to_snake_case(&p.name))
+                .collect();
+
+            let is_range_query = m.parameters.iter().any(|p| is_range_param(&p.name));
+
+            QueryMethodIR {
+                name: m.name.clone(),
+                parameters,
+                return_type,
+                indexed_columns,
+                is_range_query,
+                raw_body: m.raw_body.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Converts a camelCase string to snake_case.
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
