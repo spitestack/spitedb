@@ -310,14 +310,12 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { SpiteDbNapi, TelemetryDbNapi } = nativeBinding
+const { SpiteDbNapi, TelemetryDbNapi, TelemetryKindNapi, MetricKindNapi, SpanStatusNapi, TelemetryOrderNapi, TimeSliceNapi } = nativeBinding
 
 module.exports.SpiteDbNapi = SpiteDbNapi
-
-module.exports.SpiteDBNapi = SpiteDbNapi
-
-// Default tenant for single-tenant apps
-module.exports.DEFAULT_TENANT = 'default'
-
 module.exports.TelemetryDbNapi = TelemetryDbNapi
-module.exports.TelemetryDBNapi = TelemetryDbNapi
+module.exports.TelemetryKindNapi = TelemetryKindNapi
+module.exports.MetricKindNapi = MetricKindNapi
+module.exports.SpanStatusNapi = SpanStatusNapi
+module.exports.TelemetryOrderNapi = TelemetryOrderNapi
+module.exports.TimeSliceNapi = TimeSliceNapi

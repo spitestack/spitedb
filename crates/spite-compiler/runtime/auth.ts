@@ -160,11 +160,25 @@ export function createAuth(config: AuthConfig) {
   }
 
   async function verifyRequest(req: Request): Promise<AuthResult> {
+    // Try Authorization header first
     const authHeader = req.headers.get('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
+    let token: string | null = null;
+
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.slice(7);
+    } else {
+      // Fall back to HttpOnly cookie
+      const cookieHeader = req.headers.get('Cookie') || '';
+      const match = cookieHeader.split(';').find(c => c.trim().startsWith('spite_token='));
+      if (match) {
+        token = match.split('=')[1]?.trim() || null;
+      }
+    }
+
+    if (!token) {
       return { ok: false, error: 'Missing or invalid Authorization header' };
     }
-    const token = authHeader.slice(7);
+
     const result = await verify(token);
     if (result.ok) {
       const tokenType = (result.user as any).typ;

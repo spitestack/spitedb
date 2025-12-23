@@ -1234,13 +1234,14 @@ impl BatchWriter {
                 }
                 BatchCommand::BatchAppend(cmds) => {
                     // Pre-allocate for all commands, will be replaced with Ok or Err
+                    // Use from_raw_unchecked since these are sentinel values that will be overwritten
                     BatchResult::BatchAppend(Ok(
                         (0..cmds.len())
                             .map(|_| AppendResult {
-                                first_pos: GlobalPos::from_raw(0),
-                                last_pos: GlobalPos::from_raw(0),
-                                first_rev: StreamRev::from_raw(0),
-                                last_rev: StreamRev::from_raw(0),
+                                first_pos: GlobalPos::from_raw_unchecked(1),
+                                last_pos: GlobalPos::from_raw_unchecked(1),
+                                first_rev: StreamRev::from_raw(1),
+                                last_rev: StreamRev::from_raw(1),
                             })
                             .collect()
                     ))

@@ -6,7 +6,8 @@
     "dev": "bun run spitestack dev",
     "build": "bun run spitestack compile",
     "check": "bun run spitestack check",
-    "test": "bun test"
+    "test": "bun test",
+    "load-gen": "bun run scripts/load-gen.ts"
   },
   "devDependencies": {
     "bun-types": "latest"

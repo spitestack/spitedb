@@ -20,6 +20,8 @@ pub fn generate_router(domain: &DomainIR) -> String {
         "import { emitTelemetry, finishSpan, logError, metricCounter, metricHistogram, startSpan } from './runtime/telemetry';\n",
     );
     output.push_str("import { getSecurityHeaders } from './runtime/security-headers';\n");
+    output.push_str("import { handleAdminStatus, handleAdminMetrics, handleAdminProjections, handleAdminLogs, handleAdminEvents, handleAdminStream } from './runtime/admin';\n");
+    output.push_str("import type { AdminContext } from './runtime/admin';\n");
 
     // Import handlers for each aggregate
     for aggregate in &domain.aggregates {
@@ -65,6 +67,8 @@ pub fn generate_router(domain: &DomainIR) -> String {
     output.push_str("  db: SpiteDbNapi;\n");
     output.push_str("  telemetry: TelemetryDbNapi;\n");
     output.push_str("  authConfig: AuthConfig;\n");
+    output.push_str("  projectionNames: string[];\n");
+    output.push_str("  startTime: number;\n");
     output.push_str("};\n\n");
 
     // Router function
@@ -72,7 +76,8 @@ pub fn generate_router(domain: &DomainIR) -> String {
     output.push_str("  const auth = createAuth(ctx.authConfig);\n");
     output.push_str("  const emailProvider = createEmailProvider();\n");
     output.push_str("  const smsProvider = createSmsProvider();\n");
-    output.push_str("  const securityHeaders = getSecurityHeaders();\n\n");
+    output.push_str("  const securityHeaders = getSecurityHeaders();\n");
+    output.push_str("  const adminCtx: AdminContext = { db: ctx.db, telemetry: ctx.telemetry, projectionNames: ctx.projectionNames, startTime: ctx.startTime };\n\n");
     output.push_str("  // Helper to apply security headers to all responses\n");
     output.push_str("  const finalize = (response: Response): Response => {\n");
     output.push_str("    const headers = new Headers(response.headers);\n");
@@ -501,6 +506,65 @@ pub fn generate_router(domain: &DomainIR) -> String {
 
         output.push_str("      }\n\n");
     }
+
+    // Admin dashboard routes
+    output.push_str("      // Admin dashboard routes\n");
+    output.push_str("      if (path.startsWith('/admin')) {\n");
+    output.push_str("        // Development: proxy to Vite dev server\n");
+    output.push_str("        if (!isProd && !path.startsWith('/admin/api') && !path.startsWith('/admin/ws')) {\n");
+    output.push_str("          try {\n");
+    output.push_str("            const proxyRes = await fetch(`http://localhost:5173${path}`, {\n");
+    output.push_str("              method,\n");
+    output.push_str("              headers: req.headers,\n");
+    output.push_str("              body: method !== 'GET' && method !== 'HEAD' ? req.body : undefined,\n");
+    output.push_str("            });\n");
+    output.push_str("            return proxyRes;\n");
+    output.push_str("          } catch {\n");
+    output.push_str("            // Vite dev server not running, fall through to serve static or 404\n");
+    output.push_str("          }\n");
+    output.push_str("        }\n\n");
+    output.push_str("        // API routes require internal access (system tenant membership)\n");
+    output.push_str("        if (path.startsWith('/admin/api/')) {\n");
+    output.push_str("          const adminAccessErr = checkInternal();\n");
+    output.push_str("          if (adminAccessErr) return finalize(adminAccessErr);\n\n");
+    output.push_str("          if (path === '/admin/api/status') {\n");
+    output.push_str("            const response = await handleAdminStatus(adminCtx);\n");
+    output.push_str("            return finalize(response);\n");
+    output.push_str("          }\n");
+    output.push_str("          if (path === '/admin/api/metrics') {\n");
+    output.push_str("            const response = await handleAdminMetrics(adminCtx);\n");
+    output.push_str("            return finalize(response);\n");
+    output.push_str("          }\n");
+    output.push_str("          if (path === '/admin/api/projections') {\n");
+    output.push_str("            const response = await handleAdminProjections(adminCtx);\n");
+    output.push_str("            return finalize(response);\n");
+    output.push_str("          }\n");
+    output.push_str("          if (path === '/admin/api/logs') {\n");
+    output.push_str("            const response = await handleAdminLogs(adminCtx, url.searchParams);\n");
+    output.push_str("            return finalize(response);\n");
+    output.push_str("          }\n");
+    output.push_str("          if (path === '/admin/api/events') {\n");
+    output.push_str("            const response = await handleAdminEvents(adminCtx, url.searchParams);\n");
+    output.push_str("            return finalize(response);\n");
+    output.push_str("          }\n");
+    output.push_str("          const streamMatch = path.match(/^\\/admin\\/api\\/streams\\/([^/]+)$/);\n");
+    output.push_str("          if (streamMatch) {\n");
+    output.push_str("            const streamId = streamMatch[1];\n");
+    output.push_str("            const tenant = url.searchParams.get('tenant') ?? 'default';\n");
+    output.push_str("            const response = await handleAdminStream(adminCtx, streamId, tenant, url.searchParams);\n");
+    output.push_str("            return finalize(response);\n");
+    output.push_str("          }\n");
+    output.push_str("        }\n\n");
+    output.push_str("        // WebSocket upgrade for /admin/ws is handled in server config\n");
+    output.push_str("        if (path === '/admin/ws') {\n");
+    output.push_str("          return finalize(new Response('WebSocket upgrade required', { status: 426 }));\n");
+    output.push_str("        }\n\n");
+    output.push_str("        // Production: serve embedded SPA assets (TODO: implement asset serving)\n");
+    output.push_str("        // For now, return 404 for non-API admin routes in production\n");
+    output.push_str("        if (isProd) {\n");
+    output.push_str("          return finalize(new Response(JSON.stringify({ error: 'Admin assets not embedded' }), { status: 404, headers: { 'Content-Type': 'application/json' } }));\n");
+    output.push_str("        }\n");
+    output.push_str("      }\n\n");
 
     // 404 fallback
     output.push_str("      return finalize(new Response(JSON.stringify({ error: 'Not Found' }), { status: 404, headers: { 'Content-Type': 'application/json' } }));\n");

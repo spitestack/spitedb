@@ -364,11 +364,16 @@ impl SpiteDBNapi {
     }
 
     /// Reads events from the global log.
+    ///
+    /// @param fromPos - Starting position (0 or negative means "from beginning")
+    /// @param limit - Maximum number of events to return
     #[napi]
     pub async fn read_global(&self, from_pos: i64, limit: i64) -> Result<Vec<EventNapi>> {
+        // GlobalPos doesn't allow 0, so treat <= 0 as "from the beginning" (position 1)
+        let safe_pos = if from_pos <= 0 { 1 } else { from_pos as u64 };
         let events = self
             .inner
-            .read_global(GlobalPos::from_raw(from_pos as u64), limit as usize)
+            .read_global(GlobalPos::from_raw(safe_pos), limit as usize)
             .await
             .map_err(|e| Error::from_reason(format!("Read failed: {}", e)))?;
 

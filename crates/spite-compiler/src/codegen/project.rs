@@ -84,12 +84,20 @@ pub fn generate_tsconfig() -> &'static str {
 }
 
 /// Generates src/index.ts entry point.
-pub fn generate_index_ts(port: u16, app_name: &str) -> String {
+pub fn generate_index_ts(port: u16, app_name: &str, projection_names: &[String]) -> String {
+    // Generate the projection names array
+    let projections_str = projection_names
+        .iter()
+        .map(|name| format!("'{}'", name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     format!(
         r#"import {{ SpiteDbNapi, TelemetryDbNapi }} from '@spitestack/db';
 import {{ mkdir }} from 'node:fs/promises';
 import {{ createRouter }} from './generated/router';
 import {{ ensureSystemAdmin }} from './generated/runtime/identity';
+import {{ createAdminWebSocketHandler }} from './generated/runtime/admin-ws';
 
 const eventsDir = './data/events';
 const telemetryDir = './data/telemetry';
@@ -98,6 +106,7 @@ const telemetryDir = './data/telemetry';
 await mkdir(eventsDir, {{ recursive: true }});
 await mkdir(telemetryDir, {{ recursive: true }});
 
+const startTime = Date.now();
 const db = await SpiteDbNapi.open(`${{eventsDir}}/{}.db`);
 const telemetry = await TelemetryDbNapi.open(telemetryDir, {{ appName: '{}' }});
 
@@ -124,14 +133,29 @@ const authConfig = {{
   audience: process.env.AUTH_AUDIENCE,
 }};
 
-const router = createRouter({{ db, telemetry, authConfig }});
+// Projection names for admin dashboard
+const projectionNames: string[] = [{}];
+
+const router = createRouter({{ db, telemetry, authConfig, projectionNames, startTime }});
+const adminWsHandler = createAdminWebSocketHandler({{ db, telemetry, projectionNames, startTime }});
 
 const server = Bun.serve({{
   port: {},
-  fetch: router,
+  fetch(req, server) {{
+    // Handle WebSocket upgrade for admin dashboard
+    const url = new URL(req.url);
+    if (url.pathname === '/admin/ws') {{
+      const upgraded = server.upgrade(req);
+      if (upgraded) return undefined;
+      return new Response('WebSocket upgrade failed', {{ status: 400 }});
+    }}
+    return router(req);
+  }},
+  websocket: adminWsHandler,
 }});
 
 console.log(`🚀 SpiteStack server running at http://localhost:${{server.port}}`);
+console.log(`📊 Admin dashboard available at http://localhost:${{server.port}}/admin`);
 
 // Best-effort startup telemetry
 void telemetry.writeBatch([{{
@@ -156,7 +180,7 @@ process.on('SIGINT', () => {{
   }}]).finally(() => process.exit(0));
 }});
 "#,
-        app_name, app_name, port
+        app_name, app_name, projections_str, port
     )
 }
 

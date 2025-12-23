@@ -23,6 +23,16 @@ pub const SMS: &str = include_str!("../../runtime/sms.ts");
 pub const SOCIAL: &str = include_str!("../../runtime/social.ts");
 /// App registration module for access configuration.
 pub const APP: &str = include_str!("../../runtime/app.ts");
+/// Admin dashboard API handlers.
+pub const ADMIN: &str = include_str!("../../runtime/admin.ts");
+/// Admin dashboard WebSocket handler for real-time streaming.
+pub const ADMIN_WS: &str = include_str!("../../runtime/admin-ws.ts");
+/// Security headers module.
+pub const SECURITY_HEADERS: &str = include_str!("../../runtime/security-headers.ts");
+/// Rate limiting module.
+pub const RATE_LIMIT: &str = include_str!("../../runtime/rate-limit.ts");
+/// Password policy module.
+pub const PASSWORD_POLICY: &str = include_str!("../../runtime/password-policy.ts");
 
 /// Returns all runtime modules as (filename, content) pairs.
 pub fn get_runtime_modules() -> Vec<(&'static str, &'static str)> {
@@ -37,6 +47,11 @@ pub fn get_runtime_modules() -> Vec<(&'static str, &'static str)> {
         ("runtime/sms.ts", SMS),
         ("runtime/social.ts", SOCIAL),
         ("runtime/app.ts", APP),
+        ("runtime/admin.ts", ADMIN),
+        ("runtime/admin-ws.ts", ADMIN_WS),
+        ("runtime/security-headers.ts", SECURITY_HEADERS),
+        ("runtime/rate-limit.ts", RATE_LIMIT),
+        ("runtime/password-policy.ts", PASSWORD_POLICY),
     ]
 }
 

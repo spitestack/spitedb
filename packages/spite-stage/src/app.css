@@ -1,0 +1,161 @@
+@import '$lib/theme/variables.css';
+
+/**
+ * Global Styles - Long Island Grit
+ * 
+ * The aesthetic of a basement show in 2003.
+ * Xeroxed flyers. Worn black t-shirts. The smell of PBR.
+ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Noise texture overlay - adds that photocopied grit */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  opacity: 0.03;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Selection styling */
+::selection {
+  background: var(--color-maroon);
+  color: var(--color-bone);
+}
+
+/* Scrollbar styling - industrial, minimal */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-void);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-charcoal);
+  border: 1px solid var(--color-maroon);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-maroon);
+}
+
+/* Focus states - ember glow */
+:focus-visible {
+  outline: 2px solid var(--color-ember);
+  outline-offset: 2px;
+}
+
+/* Remove default button styles */
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: transform 50ms ease-out;
+}
+
+button:active {
+  transform: scale(0.96) translateY(1px);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Links */
+a {
+  color: var(--color-ember);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Code blocks */
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+/* Utility classes */
+.text-muted {
+  color: var(--color-text-muted);
+}
+
+.text-error {
+  color: var(--color-error);
+}
+
+.text-warning {
+  color: var(--color-warning);
+}
+
+.text-success {
+  color: var(--color-success);
+}
+
+.text-accent {
+  color: var(--color-ember);
+}
+
+/* Equipment panel base */
+.equipment-panel {
+  background: linear-gradient(180deg, #2a2a2a 0%, #1a1a1a 100%);
+  border: var(--border-panel);
+  box-shadow: var(--shadow-equipment);
+}
+
+/* Brushed metal texture */
+.brushed-metal {
+  background: linear-gradient(
+    135deg,
+    var(--color-brushed-metal) 0%,
+    #5a5a5a 25%,
+    var(--color-brushed-metal) 50%,
+    #5a5a5a 75%,
+    var(--color-brushed-metal) 100%
+  );
+  background-size: 4px 4px;
+}
+
+/* Wood side panel texture */
+.wood-panel {
+  background: linear-gradient(
+    90deg,
+    #3d2314 0%,
+    #5a3520 50%,
+    #3d2314 100%
+  );
+  box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.5);
+}

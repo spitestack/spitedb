@@ -429,7 +429,8 @@ impl Compiler {
             path: src_dir.clone(),
             message: e.to_string(),
         })?;
-        let index_ts = project::generate_index_ts(port, project_name);
+        let projection_names: Vec<String> = domain_ir.projections.iter().map(|p| p.name.clone()).collect();
+        let index_ts = project::generate_index_ts(port, project_name, &projection_names);
         std::fs::write(src_dir.join("index.ts"), index_ts).map_err(|e| CompilerError::IoError {
             path: src_dir.join("index.ts"),
             message: e.to_string(),
