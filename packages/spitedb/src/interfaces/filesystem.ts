@@ -173,4 +173,33 @@ export interface FileSystem {
    * @throws {Error} if file doesn't exist
    */
   mmap(path: string): Promise<Uint8Array>;
+
+  // === File Locking ===
+
+  /**
+   * Acquire a lock on an open file.
+   *
+   * Used to prevent multiple processes from corrupting data by ensuring
+   * exclusive access to critical files (like the data directory lock file).
+   *
+   * - 'exclusive': Only one process can hold this lock. Others will block or fail.
+   * - 'shared': Multiple processes can hold shared locks, but no exclusive locks.
+   *
+   * The lock is automatically released when the file handle is closed.
+   *
+   * @param handle - Open file handle to lock
+   * @param mode - Lock mode: 'exclusive' for writers, 'shared' for readers
+   * @throws {Error} if lock cannot be acquired (e.g., another process holds it)
+   */
+  flock(handle: FileHandle, mode: 'shared' | 'exclusive'): Promise<void>;
+
+  /**
+   * Release a lock on an open file.
+   *
+   * Note: Locks are automatically released when the file handle is closed,
+   * so explicit unlock is only needed if you want to release early.
+   *
+   * @param handle - Open file handle to unlock
+   */
+  funlock(handle: FileHandle): Promise<void>;
 }

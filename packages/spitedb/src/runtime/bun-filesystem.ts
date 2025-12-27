@@ -14,6 +14,7 @@ import {
 } from 'node:fs';
 import { open as openAsync } from 'node:fs/promises';
 import type { FileSystem, FileHandle, OpenMode, FileStat } from '../interfaces/filesystem';
+import { flock as flockFFI, LOCK_SH, LOCK_EX, LOCK_UN } from './resource-limits';
 
 // Map to store async file handles for sync() operation
 const asyncHandles = new Map<number, import('node:fs/promises').FileHandle>();
@@ -144,6 +145,26 @@ export class BunFileSystem implements FileSystem {
     } catch {
       // Fallback for environments where mmap fails (e.g., Windows edge cases)
       return await Bun.file(path).bytes();
+    }
+  }
+
+  async flock(handle: FileHandle, mode: 'shared' | 'exclusive'): Promise<void> {
+    const operation = mode === 'exclusive' ? LOCK_EX : LOCK_SH;
+    const success = flockFFI(handle.fd, operation);
+
+    if (!success) {
+      throw new Error(
+        `Failed to acquire ${mode} lock on file descriptor ${handle.fd}. ` +
+          `Another process may be holding an incompatible lock.`
+      );
+    }
+  }
+
+  async funlock(handle: FileHandle): Promise<void> {
+    const success = flockFFI(handle.fd, LOCK_UN);
+
+    if (!success) {
+      throw new Error(`Failed to release lock on file descriptor ${handle.fd}`);
     }
   }
 

@@ -35,13 +35,14 @@
  * ```
  */
 
-import type { FileSystem } from './interfaces/filesystem';
+import type { FileSystem, FileHandle } from './interfaces/filesystem';
 import type { Serializer } from './interfaces/serializer';
 import type { Compressor } from './interfaces/compressor';
 import type { Clock } from './interfaces/clock';
 import { SegmentManager } from './storage/segment-manager';
 import type { StoredEvent, StreamEntry } from './storage';
 import { ConcurrencyError } from './domain/errors';
+import { increaseFileDescriptorLimit } from './runtime/resource-limits';
 
 /**
  * Input event for appending (without position info).
@@ -140,6 +141,7 @@ export class EventStore {
   private pendingEvents: StoredEvent[] = [];
   private streamRevisions = new Map<string, number>();
   private dataDir: string = '';
+  private lockHandle: FileHandle | null = null;
 
   constructor(config: EventStoreConfig) {
     this.config = {
@@ -152,15 +154,50 @@ export class EventStore {
    * Open the event store.
    *
    * Initializes the segment manager and scans existing segments.
+   * Automatically increases file descriptor limits and acquires
+   * an exclusive lock to prevent multi-process corruption.
    *
    * @param dataDir - Directory to store segment files
+   * @throws {Error} if another process has the store open
    */
   async open(dataDir: string): Promise<void> {
     if (this.segmentManager) {
       throw new Error('EventStore already open');
     }
 
+    // Auto-configure file descriptor limits (convention over configuration)
+    const fdResult = increaseFileDescriptorLimit();
+    if (fdResult.warning) {
+      console.warn(`[spitedb] ${fdResult.warning}`);
+    }
+
     this.dataDir = dataDir;
+
+    // Ensure data directory exists
+    if (!(await this.config.fs.exists(dataDir))) {
+      await this.config.fs.mkdir(dataDir, { recursive: true });
+    }
+
+    // Acquire exclusive lock to prevent multiple writers
+    const lockPath = `${dataDir}/.lock`;
+    try {
+      this.lockHandle = await this.config.fs.open(lockPath, 'write');
+      await this.config.fs.flock(this.lockHandle, 'exclusive');
+    } catch (error) {
+      // Clean up if we opened the file but couldn't lock
+      if (this.lockHandle) {
+        try {
+          await this.config.fs.close(this.lockHandle);
+        } catch {
+          // Ignore close errors
+        }
+        this.lockHandle = null;
+      }
+      throw new Error(
+        `Failed to open EventStore: another process may have it open. ` +
+          `Lock file: ${lockPath}. Original error: ${error instanceof Error ? error.message : error}`
+      );
+    }
 
     this.segmentManager = new SegmentManager(
       this.config.fs,
@@ -182,7 +219,7 @@ export class EventStore {
   /**
    * Close the event store.
    *
-   * Flushes pending events and closes the segment manager.
+   * Flushes pending events, closes the segment manager, and releases the lock.
    */
   async close(): Promise<void> {
     if (!this.segmentManager) {
@@ -196,6 +233,12 @@ export class EventStore {
     this.segmentManager = null;
     this.streamRevisions.clear();
     this.pendingEvents = [];
+
+    // Release the lock (closing the handle automatically releases flock)
+    if (this.lockHandle) {
+      await this.config.fs.close(this.lockHandle);
+      this.lockHandle = null;
+    }
   }
 
   /**

@@ -53,3 +53,5 @@ export {
   type SegmentInfo,
   type RecoveryResult,
 } from './segment-manager';
+
+export { Manifest, type ManifestSegment } from './manifest';

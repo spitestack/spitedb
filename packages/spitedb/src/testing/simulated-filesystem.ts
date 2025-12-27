@@ -13,6 +13,18 @@ interface FileState {
   unflushed: Array<{ offset: number; data: Uint8Array }>;
   /** Open mode */
   mode: OpenMode;
+  /** Current lock held by this handle */
+  lock?: 'shared' | 'exclusive';
+}
+
+/**
+ * Lock state for a file.
+ */
+interface LockState {
+  /** File descriptors holding shared locks */
+  sharedLocks: Set<number>;
+  /** File descriptor holding exclusive lock (or null) */
+  exclusiveLock: number | null;
 }
 
 /**
@@ -66,6 +78,9 @@ export class SimulatedFileSystem implements FileSystem {
   /** Open file handles */
   private handles = new Map<number, FileState>();
 
+  /** File locks by path */
+  private locks = new Map<string, LockState>();
+
   /** Next file descriptor number */
   private nextFd = 1;
 
@@ -106,8 +121,9 @@ export class SimulatedFileSystem implements FileSystem {
     for (const state of this.handles.values()) {
       state.unflushed = [];
     }
-    // Close all handles
+    // Close all handles (and release all locks)
     this.handles.clear();
+    this.locks.clear();
   }
 
   // ============================================================
@@ -184,6 +200,12 @@ export class SimulatedFileSystem implements FileSystem {
     if (!state) {
       throw new Error('Invalid file handle');
     }
+
+    // Release any locks held by this handle
+    if (state.lock) {
+      await this.funlock(handle);
+    }
+
     // Note: We don't automatically sync on close - this matches real behavior
     // where data can be lost if close happens without sync
     this.handles.delete(handle.fd);
@@ -461,6 +483,90 @@ export class SimulatedFileSystem implements FileSystem {
 
     // Return a copy to avoid mutation issues in tests
     return new Uint8Array(content);
+  }
+
+  async flock(handle: FileHandle, mode: 'shared' | 'exclusive'): Promise<void> {
+    const state = this.handles.get(handle.fd);
+    if (!state) {
+      throw new Error('Invalid file handle');
+    }
+
+    const path = state.path;
+
+    // Get or create lock state for this path
+    let lockState = this.locks.get(path);
+    if (!lockState) {
+      lockState = { sharedLocks: new Set(), exclusiveLock: null };
+      this.locks.set(path, lockState);
+    }
+
+    // Release any existing lock this handle might hold
+    if (state.lock) {
+      await this.funlock(handle);
+      // Re-fetch lock state as funlock may have cleaned it up
+      lockState = this.locks.get(path);
+      if (!lockState) {
+        lockState = { sharedLocks: new Set(), exclusiveLock: null };
+        this.locks.set(path, lockState);
+      }
+    }
+
+    if (mode === 'exclusive') {
+      // Exclusive lock requires no other locks exist
+      if (lockState.exclusiveLock !== null) {
+        throw new Error(
+          `Failed to acquire exclusive lock on ${path}: ` +
+            `another process holds an exclusive lock`
+        );
+      }
+      if (lockState.sharedLocks.size > 0) {
+        throw new Error(
+          `Failed to acquire exclusive lock on ${path}: ` +
+            `${lockState.sharedLocks.size} shared lock(s) are held`
+        );
+      }
+      lockState.exclusiveLock = handle.fd;
+    } else {
+      // Shared lock requires no exclusive lock
+      if (lockState.exclusiveLock !== null) {
+        throw new Error(
+          `Failed to acquire shared lock on ${path}: ` +
+            `another process holds an exclusive lock`
+        );
+      }
+      lockState.sharedLocks.add(handle.fd);
+    }
+
+    state.lock = mode;
+  }
+
+  async funlock(handle: FileHandle): Promise<void> {
+    const state = this.handles.get(handle.fd);
+    if (!state) {
+      throw new Error('Invalid file handle');
+    }
+
+    if (!state.lock) {
+      return; // No lock to release
+    }
+
+    const lockState = this.locks.get(state.path);
+    if (lockState) {
+      if (state.lock === 'exclusive') {
+        if (lockState.exclusiveLock === handle.fd) {
+          lockState.exclusiveLock = null;
+        }
+      } else {
+        lockState.sharedLocks.delete(handle.fd);
+      }
+
+      // Clean up empty lock state
+      if (lockState.exclusiveLock === null && lockState.sharedLocks.size === 0) {
+        this.locks.delete(state.path);
+      }
+    }
+
+    delete state.lock;
   }
 
   /**

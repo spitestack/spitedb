@@ -38,6 +38,7 @@ import { StreamMap } from './stream-map';
 import { LRUCache } from './lru-cache';
 import { decodeSegmentHeader, SEGMENT_HEADER_SIZE } from './segment-header';
 import type { StoredEvent } from './stored-event';
+import { Manifest } from './manifest';
 
 /**
  * Configuration for the segment manager.
@@ -97,6 +98,7 @@ export class SegmentManager {
   private readonly indexCache: LRUCache<bigint, SegmentIndex>;
   private readonly indexFileCache: LRUCache<bigint, SegmentIndexFile>;
   private readonly streamMap: StreamMap;
+  private readonly manifest: Manifest;
 
   private segments = new Map<bigint, SegmentInfo>();
   private activeWriter: SegmentWriter | null = null;
@@ -122,12 +124,18 @@ export class SegmentManager {
     this.indexCache = new LRUCache(this.config.indexCacheSize);
     this.indexFileCache = new LRUCache(this.config.indexCacheSize);
     this.streamMap = new StreamMap();
+    this.manifest = new Manifest(fs);
   }
 
   /**
-   * Initialize the manager by scanning existing segments.
+   * Initialize the manager by loading manifest or scanning existing segments.
    *
    * Must be called before any other operations.
+   *
+   * Initialization order:
+   * 1. Try to load manifest (fast path)
+   * 2. If manifest loads, use it to populate segments
+   * 3. If manifest fails, fall back to directory scan and create new manifest
    */
   async initialize(): Promise<void> {
     if (this.initialized) {
@@ -139,7 +147,60 @@ export class SegmentManager {
       await this.fs.mkdir(this.config.dataDir, { recursive: true });
     }
 
-    // Scan for existing segments
+    // Try to load manifest (fast path)
+    const manifestLoaded = await this.manifest.load(this.config.dataDir);
+
+    if (manifestLoaded) {
+      // Use manifest to populate segments
+      for (const seg of this.manifest.getSegments()) {
+        const path = `${this.config.dataDir}/${seg.path}`;
+
+        // Verify segment file still exists
+        if (await this.fs.exists(path)) {
+          try {
+            const stat = await this.fs.stat(path);
+            this.segments.set(seg.id, {
+              id: seg.id,
+              path,
+              size: stat.size,
+              basePosition: seg.basePosition,
+              isActive: false,
+            });
+          } catch {
+            // Segment file invalid, will be handled by StreamMap rebuild
+          }
+        }
+      }
+
+      this.nextSegmentId = this.manifest.getNextSegmentId();
+      this.globalPosition = this.manifest.getGlobalPosition();
+    } else {
+      // Fall back to directory scan (slow path)
+      await this.scanDirectory();
+
+      // Save manifest for next time
+      this.manifest.initializeFromScan(
+        Array.from(this.segments.values()).map((seg) => ({
+          id: seg.id,
+          path: seg.path.split('/').pop()!, // Store relative path
+          basePosition: seg.basePosition,
+        })),
+        this.globalPosition,
+        this.nextSegmentId
+      );
+      await this.manifest.save();
+    }
+
+    // Load .idx files and rebuild StreamMap
+    await this.rebuildStreamMap();
+
+    this.initialized = true;
+  }
+
+  /**
+   * Scan directory for segment files (fallback when manifest unavailable).
+   */
+  private async scanDirectory(): Promise<void> {
     const files = await this.fs.readdir(this.config.dataDir);
     const segmentFiles = files.filter((f) => f.startsWith('segment-') && f.endsWith('.log'));
 
@@ -166,11 +227,6 @@ export class SegmentManager {
         console.warn(`Skipping invalid segment file: ${file}`, error);
       }
     }
-
-    // Load .idx files and rebuild StreamMap
-    await this.rebuildStreamMap();
-
-    this.initialized = true;
   }
 
   /**
@@ -352,6 +408,20 @@ export class SegmentManager {
       isActive: true,
     });
 
+    // Update manifest with new segment
+    const segmentFileName = path.split('/').pop()!;
+    this.manifest.addSegment({
+      id: segmentId,
+      path: segmentFileName,
+      basePosition: this.globalPosition,
+    });
+    this.manifest.setNextSegmentId(this.nextSegmentId);
+
+    // Save manifest (non-blocking - failure is recoverable via directory scan)
+    this.manifest.save().catch((err) => {
+      console.warn(`Failed to save manifest after rotation:`, err);
+    });
+
     // Close old writer in background (writes .idx file)
     // This avoids blocking appends on potentially slow index writes
     if (oldWriter) {
@@ -491,6 +561,14 @@ export class SegmentManager {
     if (this.activeWriter) {
       await this.activeWriter.close();
       this.activeWriter = null;
+    }
+
+    // Save manifest with final state
+    this.manifest.setGlobalPosition(this.globalPosition);
+    try {
+      await this.manifest.save();
+    } catch (err) {
+      console.warn(`Failed to save manifest on close:`, err);
     }
 
     this.indexCache.clear();
