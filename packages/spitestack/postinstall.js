@@ -20,6 +20,22 @@ const PLATFORM_MAP = {
   "win32-x64": "spite-windows-x64.exe",
 };
 
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function printProgress(downloaded, total) {
+  const percent = total ? Math.round((downloaded / total) * 100) : 0;
+  const barWidth = 30;
+  const filled = Math.round((percent / 100) * barWidth);
+  const empty = barWidth - filled;
+  const bar = "█".repeat(filled) + "░".repeat(empty);
+
+  process.stdout.write(`\r  [${bar}] ${percent}% (${formatBytes(downloaded)})`);
+}
+
 async function main() {
   const key = `${process.platform}-${process.arch}`;
   const binary = PLATFORM_MAP[key];
@@ -42,7 +58,7 @@ async function main() {
     fs.mkdirSync(binDir, { recursive: true });
   }
 
-  console.log(`\nDownloading spitestack v${VERSION} for ${key}...`);
+  console.log(`\n  Downloading spitestack v${VERSION} for ${key}...`);
 
   try {
     await download(url, dest);
@@ -52,11 +68,11 @@ async function main() {
       fs.chmodSync(dest, 0o755);
     }
 
-    console.log("Done!\n");
+    console.log("\n  Done!\n");
   } catch (error) {
-    console.error(`\nFailed to download spitestack binary: ${error.message}`);
-    console.error(`URL: ${url}`);
-    console.error("\nYou can manually download from: https://github.com/spitestack/spitestack/releases\n");
+    console.error(`\n\n  Failed to download: ${error.message}`);
+    console.error(`  URL: ${url}`);
+    console.error("\n  Manual download: https://github.com/spitestack/spitestack/releases\n");
     process.exit(1);
   }
 }
@@ -82,7 +98,16 @@ function download(url, dest) {
             return;
           }
 
+          const totalSize = parseInt(res.headers["content-length"], 10) || 0;
+          let downloaded = 0;
+
           const file = fs.createWriteStream(dest);
+
+          res.on("data", (chunk) => {
+            downloaded += chunk.length;
+            printProgress(downloaded, totalSize);
+          });
+
           res.pipe(file);
 
           file.on("finish", () => {
