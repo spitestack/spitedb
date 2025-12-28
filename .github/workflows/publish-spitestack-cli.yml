@@ -101,6 +101,7 @@ jobs:
     name: Publish to npm
     needs: release
     runs-on: ubuntu-latest
+    environment: release
     env:
       GH_REF: ${{ github.ref }}
     steps:
