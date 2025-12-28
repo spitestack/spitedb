@@ -1,5 +1,5 @@
-import type { FileSystem, FileHandle, OpenMode, FileStat } from '../interfaces/filesystem';
-import type { Clock } from '../interfaces/clock';
+import type { FileSystem, FileHandle, OpenMode, FileStat } from '../ports/storage/filesystem';
+import type { Clock } from '../ports/time/clock';
 
 /**
  * Internal state for an open file handle.
@@ -198,7 +198,7 @@ export class SimulatedFileSystem implements FileSystem {
   async close(handle: FileHandle): Promise<void> {
     const state = this.handles.get(handle.fd);
     if (!state) {
-      throw new Error('Invalid file handle');
+      return;
     }
 
     // Release any locks held by this handle

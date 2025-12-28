@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["bun-types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "include": ["src/**/*", "test/**/*", "bin/**/*"],
+  "exclude": ["node_modules"]
+}

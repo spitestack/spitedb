@@ -17,6 +17,6 @@
     "noPropertyAccessFromIndexSignature": true,
     "exactOptionalPropertyTypes": true
   },
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["src/**/*", "test/**/*", "bench/**/*"],
   "exclude": ["node_modules"]
 }

@@ -1,4 +1,4 @@
-import type { Clock, Timer } from '../interfaces/clock';
+import type { Clock, Timer } from '../ports/time/clock';
 
 /**
  * Internal state for a scheduled task.
@@ -6,8 +6,8 @@ import type { Clock, Timer } from '../interfaces/clock';
 interface ScheduledTask {
   /** Scheduled execution time (simulated) */
   time: number;
-  /** Callback to execute */
-  callback: () => void;
+  /** Callback to execute (may be async) */
+  callback: () => void | Promise<void>;
   /** If set, this is an interval timer */
   interval?: number;
   /** If true, timer has been cancelled */
@@ -58,6 +58,9 @@ export class SimulatedClock implements Clock {
 
   /** Pending sleep resolvers */
   private sleepResolvers: Array<{ time: number; resolve: () => void }> = [];
+
+  /** Pending promises from async callbacks */
+  private pendingAsyncCallbacks: Promise<void>[] = [];
 
   now(): number {
     return this.currentTime;
@@ -195,6 +198,28 @@ export class SimulatedClock implements Clock {
   }
 
   /**
+   * Advance time and await all async callbacks.
+   * Use this when timers may have async callbacks that need to complete.
+   * @param ms - Duration to advance in milliseconds
+   */
+  async tickAsync(ms: number): Promise<void> {
+    this.tick(ms);
+    await this.flushAsyncCallbacks();
+  }
+
+  /**
+   * Await all pending async callbacks without advancing time.
+   * Call this after tick() to ensure async callbacks have completed.
+   */
+  async flushAsyncCallbacks(): Promise<void> {
+    while (this.pendingAsyncCallbacks.length > 0) {
+      const pending = [...this.pendingAsyncCallbacks];
+      this.pendingAsyncCallbacks = [];
+      await Promise.all(pending);
+    }
+  }
+
+  /**
    * Get the current simulated time.
    */
   getCurrentTime(): number {
@@ -222,6 +247,7 @@ export class SimulatedClock implements Clock {
     this.currentTime = 0;
     this.tasks = [];
     this.sleepResolvers = [];
+    this.pendingAsyncCallbacks = [];
   }
 
   /**
@@ -276,8 +302,11 @@ export class SimulatedClock implements Clock {
       // Remove task from queue
       this.tasks.shift();
 
-      // Execute callback
-      task.callback();
+      // Execute callback and capture promise if async
+      const result = task.callback();
+      if (result instanceof Promise) {
+        this.pendingAsyncCallbacks.push(result);
+      }
 
       // Reschedule interval tasks
       if (task.interval && !task.cancelled) {

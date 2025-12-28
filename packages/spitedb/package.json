@@ -9,6 +9,7 @@
     "./testing": "./src/testing/index.ts"
   },
   "scripts": {
+    "bench:load": "bun run bench/load-test.ts",
     "test": "bun test",
     "test:watch": "bun test --watch",
     "typecheck": "tsc --noEmit"

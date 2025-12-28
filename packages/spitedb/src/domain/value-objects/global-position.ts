@@ -4,65 +4,55 @@ import { InvalidPositionError } from '../errors/invalid-position.error';
  * Value object representing a position in the global event log.
  *
  * GlobalPosition is a monotonically increasing value that uniquely
- * identifies an event's position across all streams. Uses bigint
- * internally to support very large event stores.
+ * identifies an event's position across all streams.
  *
  * @example
  * ```ts
- * const pos = GlobalPosition.from(1000n);
+ * const pos = GlobalPosition.from(1000);
  * const next = pos.next();
  * ```
  */
 export class GlobalPosition {
-  private constructor(private readonly value: bigint) {}
+  private constructor(private readonly value: number) {}
 
   /**
-   * Create a GlobalPosition from a bigint or number value.
+   * Create a GlobalPosition from a number value.
    * @throws {InvalidPositionError} if the value is negative
    */
-  static from(value: bigint | number): GlobalPosition {
-    const bigintValue = BigInt(value);
-    if (bigintValue < 0n) {
+  static from(value: number): GlobalPosition {
+    if (!Number.isSafeInteger(value)) {
+      throw new InvalidPositionError('GlobalPosition must be a safe integer');
+    }
+    if (value < 0) {
       throw new InvalidPositionError('GlobalPosition cannot be negative');
     }
-    return new GlobalPosition(bigintValue);
+    return new GlobalPosition(value);
   }
 
   /**
    * The beginning of the log (position 0)
    */
-  static readonly BEGINNING = GlobalPosition.from(0n);
+  static readonly BEGINNING = GlobalPosition.from(0);
 
   /**
-   * Get the position as a bigint
-   */
-  toBigInt(): bigint {
-    return this.value;
-  }
-
-  /**
-   * Get the position as a number.
-   * @throws {Error} if the position exceeds Number.MAX_SAFE_INTEGER
+   * Get the position as a number
    */
   toNumber(): number {
-    if (this.value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new Error('GlobalPosition too large to convert to number');
-    }
-    return Number(this.value);
+    return this.value;
   }
 
   /**
    * Get the next position (current + 1)
    */
   next(): GlobalPosition {
-    return new GlobalPosition(this.value + 1n);
+    return new GlobalPosition(this.value + 1);
   }
 
   /**
    * Advance by a specified count
    */
   advance(count: number): GlobalPosition {
-    return new GlobalPosition(this.value + BigInt(count));
+    return new GlobalPosition(this.value + count);
   }
 
   /**
