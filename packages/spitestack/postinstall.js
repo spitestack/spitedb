@@ -33,7 +33,8 @@ function printProgress(downloaded, total) {
   const empty = barWidth - filled;
   const bar = "█".repeat(filled) + "░".repeat(empty);
 
-  process.stdout.write(`\r  [${bar}] ${percent}% (${formatBytes(downloaded)})`);
+  // Use stderr - npm suppresses stdout during postinstall
+  process.stderr.write(`\r  [${bar}] ${percent}% (${formatBytes(downloaded)})`);
 }
 
 async function main() {
@@ -58,7 +59,8 @@ async function main() {
     fs.mkdirSync(binDir, { recursive: true });
   }
 
-  console.log(`\n  Downloading spitestack v${VERSION} for ${key}...`);
+  // Use stderr - npm suppresses stdout during postinstall
+  console.error(`\n  Downloading spitestack v${VERSION} for ${key}...`);
 
   try {
     await download(url, dest);
@@ -68,7 +70,7 @@ async function main() {
       fs.chmodSync(dest, 0o755);
     }
 
-    console.log("\n  Done!\n");
+    console.error("\n  Done!\n");
   } catch (error) {
     console.error(`\n\n  Failed to download: ${error.message}`);
     console.error(`  URL: ${url}`);
