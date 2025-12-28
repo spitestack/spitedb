@@ -4,7 +4,7 @@
   "description": "Event sourcing framework - code angry",
   "license": "MIT",
   "bin": {
-    "spite": "./bin/spite"
+    "spitestack": "./bin/spitestack"
   },
   "scripts": {
     "postinstall": "node postinstall.js"

@@ -33,7 +33,7 @@ async function main() {
 
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${binary}`;
   const isWindows = process.platform === "win32";
-  const destName = isWindows ? "spite.exe" : "spite-bin";
+  const destName = isWindows ? "spitestack-bin.exe" : "spitestack-bin";
   const dest = path.join(__dirname, "bin", destName);
 
   // Ensure bin directory exists
@@ -42,7 +42,7 @@ async function main() {
     fs.mkdirSync(binDir, { recursive: true });
   }
 
-  console.log(`\nDownloading spite v${VERSION} for ${key}...`);
+  console.log(`\nDownloading spitestack v${VERSION} for ${key}...`);
 
   try {
     await download(url, dest);
@@ -54,7 +54,7 @@ async function main() {
 
     console.log("Done!\n");
   } catch (error) {
-    console.error(`\nFailed to download spite binary: ${error.message}`);
+    console.error(`\nFailed to download spitestack binary: ${error.message}`);
     console.error(`URL: ${url}`);
     console.error("\nYou can manually download from: https://github.com/spitestack/spitestack/releases\n");
     process.exit(1);
