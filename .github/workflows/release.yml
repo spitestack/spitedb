@@ -97,11 +97,10 @@ jobs:
           draft: false
           prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
 
-  publish-npm:
+  publish:
     name: Publish to npm
     needs: release
     runs-on: ubuntu-latest
-    environment: release
     env:
       GH_REF: ${{ github.ref }}
     steps:
@@ -111,7 +110,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Update package version and publish
@@ -125,11 +124,11 @@ jobs:
 
           # Determine npm tag based on version
           if [[ "$VERSION" == *"alpha"* ]]; then
-            npm publish --access public --tag alpha --provenance
+            npm publish --access public --tag alpha
           elif [[ "$VERSION" == *"beta"* ]]; then
-            npm publish --access public --tag beta --provenance
+            npm publish --access public --tag beta
           elif [[ "$VERSION" == *"rc"* ]]; then
-            npm publish --access public --tag rc --provenance
+            npm publish --access public --tag rc
           else
-            npm publish --access public --provenance
+            npm publish --access public
           fi
