@@ -123,13 +123,5 @@ jobs:
           cd packages/spitestack
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-          # Determine npm tag based on version
-          if [[ "$VERSION" == *"alpha"* ]]; then
-            npm publish --access public --tag alpha
-          elif [[ "$VERSION" == *"beta"* ]]; then
-            npm publish --access public --tag beta
-          elif [[ "$VERSION" == *"rc"* ]]; then
-            npm publish --access public --tag rc
-          else
-            npm publish --access public
-          fi
+          # Publish to latest (alpha/beta/rc will also be latest during early dev)
+          npm publish --access public
