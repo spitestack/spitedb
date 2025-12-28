@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -100,6 +101,7 @@ jobs:
     name: Publish to npm
     needs: release
     runs-on: ubuntu-latest
+    environment: release
     env:
       GH_REF: ${{ github.ref }}
     steps:
@@ -113,8 +115,6 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Update package version and publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Extract version from tag (refs/tags/v0.1.0 -> 0.1.0)
           VERSION="${GH_REF#refs/tags/v}"
@@ -125,11 +125,11 @@ jobs:
 
           # Determine npm tag based on version
           if [[ "$VERSION" == *"alpha"* ]]; then
-            npm publish --access public --tag alpha
+            npm publish --access public --tag alpha --provenance
           elif [[ "$VERSION" == *"beta"* ]]; then
-            npm publish --access public --tag beta
+            npm publish --access public --tag beta --provenance
           elif [[ "$VERSION" == *"rc"* ]]; then
-            npm publish --access public --tag rc
+            npm publish --access public --tag rc --provenance
           else
-            npm publish --access public
+            npm publish --access public --provenance
           fi
